@@ -22,12 +22,18 @@ from libp2p.peer.peerinfo import (
     info_from_p2p_addr,
 )
 from libp2p.utils.address_validation import (
-    get_optimal_binding_address,
+    get_available_interfaces,
 )
+import socket
 
 PROTOCOL_ID = TProtocol("/echo/1.0.0")
 MAX_READ_LEN = 2**32 - 1
 
+def find_free_port():
+    """Find a free port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))  # Bind to a free port provided by the OS
+        return s.getsockname()[1]
 
 async def _echo_stream_handler(stream: INetStream) -> None:
     try:
@@ -47,8 +53,10 @@ async def _echo_stream_handler(stream: INetStream) -> None:
 
 async def run(port: int, destination: str, seed: int | None = None) -> None:
     # CHANGED: previously hardcoded 0.0.0.0
-    listen_addr = get_optimal_binding_address(port)
-
+    if port <= 0:
+        port = find_free_port()
+    listen_addr = get_available_interfaces(port)
+    
     if seed:
         import random
         random.seed(seed)
@@ -59,7 +67,7 @@ async def run(port: int, destination: str, seed: int | None = None) -> None:
         secret = secrets.token_bytes(32)
 
     host = new_host(key_pair=create_new_key_pair(secret))
-    async with host.run(listen_addrs=[listen_addr]), trio.open_nursery() as nursery:
+    async with host.run(listen_addrs=listen_addr), trio.open_nursery() as nursery:
         # Start the peer-store cleanup task
         nursery.start_soon(host.get_peerstore().start_cleanup_task, 60)
 
@@ -69,9 +77,10 @@ async def run(port: int, destination: str, seed: int | None = None) -> None:
             host.set_stream_handler(PROTOCOL_ID, _echo_stream_handler)
 
             # Print all listen addresses with peer ID (JS parity)
-            print("Listener ready, listening on:")
+            print("Listener ready, listening on:\n")
             peer_id = host.get_id().to_string()
-            print(f"{listen_addr}/p2p/{peer_id}")
+            for addr in listen_addr:
+                print(f"{addr}/p2p/{peer_id}")
 
             print(
                 "\nRun this from the same folder in another console:\n\n"
