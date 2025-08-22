@@ -105,25 +105,43 @@ class PublicKeyValidator(Validator):
         except Exception as e:
             raise ErrInvalidMultihash(f"invalid peer ID in key: {e}")
 
-        # Try to parse the public key protobuf
+        # Try to parse and deserialize the public key protobuf
         try:
+            # First parse the protobuf to get the key type and data
             protobuf_key = PublicKey.deserialize_from_protobuf(value)
+            
+            # Validate protobuf structure
+            if not hasattr(protobuf_key, 'key_type') or not hasattr(protobuf_key, 'data'):
+                raise ErrInvalidPublicKey("invalid public key protobuf structure")
+            
         except Exception as e:
             raise ErrInvalidPublicKey(f"failed to parse public key protobuf: {e}")
 
-        # For now, we'll skip the detailed validation since we need to reconstruct
-        # the actual PublicKey object from the protobuf, which requires knowing
-        # the key type and using the appropriate crypto module.
-        # This is a simplified validation that just checks the protobuf is valid.
-
-        # In a full implementation, we would:
-        # 1. Extract key_type and data from protobuf_key
-        # 2. Create the appropriate PublicKey subclass (Ed25519PublicKey, etc.)
-        # 3. Generate peer ID and compare with the expected one
-
-        # For demonstration purposes, we'll just validate the protobuf structure
-        if not hasattr(protobuf_key, 'key_type') or not hasattr(protobuf_key, 'data'):
-            raise ErrInvalidPublicKey("invalid public key protobuf structure")
+        # Deserialize the public key to get the actual PublicKey object
+        try:
+            from libp2p.crypto.serialization import deserialize_public_key
+            from libp2p.peer.id import ID
+            
+            # Deserialize the public key bytes to get the actual key object
+            public_key = deserialize_public_key(value)
+            
+            # Generate peer ID from the public key
+            generated_peer_id = ID.from_pubkey(public_key)
+            
+            # Compare the generated peer ID with the expected peer ID from the key
+            expected_peer_id_str = path  # This is the peer ID part from "/pk/<peer-id>"
+            
+            # Convert generated peer ID to base58 for comparison
+            if generated_peer_id.to_base58() != expected_peer_id_str:
+                raise ErrInvalidPublicKey(
+                    f"public key does not match expected peer ID: "
+                    f"expected {expected_peer_id_str}, got {generated_peer_id.to_base58()}"
+                )
+                
+        except Exception as e:
+            if isinstance(e, ErrInvalidPublicKey):
+                raise
+            raise ErrInvalidPublicKey(f"failed to validate public key: {e}")
 
     def select(self, key: str, values: List[bytes]) -> int:
         """

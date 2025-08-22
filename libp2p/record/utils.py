@@ -11,7 +11,7 @@ def SplitKey(key: str) -> Tuple[str, str]:
     """
     Split a record key into namespace and path components.
     
-    Expected key format: "/namespace/path" or "namespace/path"
+    Expected key format: "/namespace/path" where path can contain multiple levels
     
     Args:
         key: The record key to split
@@ -25,14 +25,13 @@ def SplitKey(key: str) -> Tuple[str, str]:
     """
     if not key:
         raise ErrInvalidRecordType("empty key")
-
-    # Remove leading slash if present
+        
+    # Handle keys with or without leading slash
     if key.startswith("/"):
-        key = key[1:]
-
-    # Split on first slash
-    parts = key.split("/", 1)
-
+        key = key[1:]  # Remove leading slash
+    
+    parts = key.split("/", 1)  # Split into at most 2 parts
+    
     if len(parts) < 2:
         raise ErrInvalidRecordType(f"invalid key format: {key}")
 

@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+message Record {
+  // The key that references this record
+  bytes key = 1;
+
+  // The actual value this record is storing
+  bytes value = 2;
+
+  // Hash of the author's public key
+  string author = 3;
+
+  // A PKI signature for the key+value+author
+  bytes signature = 4;
+
+  // Time the record was received, set by receiver
+  string timeReceived = 5;
+}
