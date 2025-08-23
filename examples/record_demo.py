@@ -14,7 +14,7 @@ import os
 import sys
 
 # Add the parent directory to the path so we can import libp2p
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from libp2p.crypto.ed25519 import create_new_key_pair
 from libp2p.peer.id import ID as PeerID
@@ -82,7 +82,7 @@ def demo_key_splitting():
         "/pk/QmTest123",
         "/custom/namespace/path",
         "ipns/example.com",
-        "/test/multi/level/path"
+        "/test/multi/level/path",
     ]
 
     for key in test_keys:
@@ -138,11 +138,7 @@ def demo_selection():
 
     # Test selection with custom validator (selects longest)
     key = "/custom/test"
-    values = [
-        b"short",
-        b"this is a much longer value",
-        b"medium length value"
-    ]
+    values = [b"short", b"this is a much longer value", b"medium length value"]
 
     try:
         selected_index = validator.select(key, values)

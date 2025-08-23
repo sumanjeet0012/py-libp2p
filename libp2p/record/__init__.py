@@ -12,10 +12,10 @@ from .utils import SplitKey
 
 __all__ = [
     "ErrInvalidRecordType",
-    "MakePutRecord", 
+    "MakePutRecord",
     "Record",
     "NamespacedValidator",
-    "PublicKeyValidator", 
+    "PublicKeyValidator",
     "Validator",
     "SplitKey",
 ]
