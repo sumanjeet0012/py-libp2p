@@ -436,6 +436,7 @@ class Pubsub(Service, IPubsub):
         :param stream: newly created stream
         """
         peer_id = stream.muxed_conn.peer_id
+        print(f"[PUBSUB DEBUG] stream_handler called for peer: {peer_id}, protocol: {stream.get_protocol()}")
 
         try:
             await self.continuously_read_stream(stream)
@@ -446,6 +447,7 @@ class Pubsub(Service, IPubsub):
                 peer_id,
                 error,
             )
+            print(f"[PUBSUB DEBUG] Error reading stream from peer {peer_id}: {error}")
             await stream.reset()
             self._handle_dead_peer(peer_id)
 
@@ -454,30 +456,48 @@ class Pubsub(Service, IPubsub):
         await self.event_handle_dead_peer_queue_started.wait()
 
     async def _handle_new_peer(self, peer_id: ID) -> None:
+        print(f"[PUBSUB DEBUG] _handle_new_peer called for peer: {peer_id}")
+        
+        # Check if we already have a pubsub stream with this peer to avoid duplicates
+        if peer_id in self.peers:
+            logger.debug("Peer %s already has pubsub stream, skipping", peer_id)
+            print(f"[PUBSUB DEBUG] Peer {peer_id} already has pubsub stream, skipping")
+            return
+        
         if self.is_peer_blacklisted(peer_id):
             logger.debug("Rejecting blacklisted peer %s", peer_id)
+            print(f"[PUBSUB DEBUG] Peer {peer_id} is blacklisted, rejecting")
             return
 
         try:
+            print(f"[PUBSUB DEBUG] Opening new stream to peer {peer_id} with protocols: {self.protocols}")
             stream: INetStream = await self.host.new_stream(peer_id, self.protocols)
+            print(f"[PUBSUB DEBUG] Stream opened successfully to peer {peer_id}, protocol: {stream.get_protocol()}")
         except SwarmException as error:
             logger.debug("fail to add new peer %s, error %s", peer_id, error)
+            print(f"[PUBSUB DEBUG] SwarmException opening stream to {peer_id}: {error}")
             return
 
         # Send hello packet
         hello = self.get_hello_packet()
         try:
+            print(f"[PUBSUB DEBUG] Sending hello packet to peer {peer_id}, subscribed topics: {list(self.topic_ids)}")
             await stream.write(encode_varint_prefixed(hello.SerializeToString()))
+            print(f"[PUBSUB DEBUG] Hello packet sent successfully to peer {peer_id}")
         except StreamClosed:
             logger.debug("Fail to add new peer %s: stream closed", peer_id)
+            print(f"[PUBSUB DEBUG] Stream closed while sending hello to {peer_id}")
             return
         try:
             self.router.add_peer(peer_id, stream.get_protocol())
+            print(f"[PUBSUB DEBUG] Added peer {peer_id} to router with protocol {stream.get_protocol()}")
         except Exception as error:
             logger.debug("fail to add new peer %s, error %s", peer_id, error)
+            print(f"[PUBSUB DEBUG] Error adding peer {peer_id} to router: {error}")
             return
 
         self.peers[peer_id] = stream
+        print(f"[PUBSUB DEBUG] Peer {peer_id} successfully added to pubsub.peers")
 
         logger.debug("added new peer %s", peer_id)
 
@@ -504,6 +524,7 @@ class Pubsub(Service, IPubsub):
         self.router.remove_peer(peer_id)
 
         logger.debug("removed dead peer %s", peer_id)
+        print(f"[PUBSUB DEBUG] Removed dead peer: {peer_id}")
 
     async def handle_peer_queue(self) -> None:
         """
@@ -511,9 +532,11 @@ class Pubsub(Service, IPubsub):
         open a stream to the peer using a supported pubsub protocol pubsub
         protocols we support.
         """
+        print("[PUBSUB DEBUG] handle_peer_queue started")
         async with self.peer_receive_channel:
             self.event_handle_peer_queue_started.set()
             async for peer_id in self.peer_receive_channel:
+                print(f"[PUBSUB DEBUG] Received peer from queue: {peer_id}")
                 # Add Peer - wrap in exception handler to prevent service crash
                 self.manager.run_task(self._handle_new_peer_safe, peer_id)
 
@@ -521,11 +544,27 @@ class Pubsub(Service, IPubsub):
         """
         Continuously read from dead peer channel and close the stream
         between that peer and remove peer info from pubsub and pubsub router.
+        Only removes the peer if there are no remaining active connections.
         """
         async with self.dead_peer_receive_channel:
             self.event_handle_dead_peer_queue_started.set()
             async for peer_id in self.dead_peer_receive_channel:
-                # Remove Peer
+                # Check if peer still has active connections before removing
+                # This prevents premature removal when multiple connections exist
+                network = self.host.get_network()
+                remaining_connections = network.get_connections(peer_id)
+                if remaining_connections:
+                    # Filter out closed connections
+                    active_connections = [c for c in remaining_connections if not c.is_closed]
+                    if active_connections:
+                        logger.debug(
+                            "Peer %s still has %d active connections, not removing",
+                            peer_id, len(active_connections)
+                        )
+                        print(f"[PUBSUB DEBUG] Peer {peer_id} still has {len(active_connections)} active connections, not removing")
+                        continue
+                # Remove Peer - no more active connections
+                print(f"[PUBSUB DEBUG] No active connections for peer {peer_id}, removing from pubsub")
                 self._handle_dead_peer(peer_id)
 
     def handle_subscription(

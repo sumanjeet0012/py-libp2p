@@ -155,11 +155,15 @@ class SwarmConn(INetConn):
 
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
+        print(f"[SWARM_CONN DEBUG] _handle_new_streams started for peer: {self.muxed_conn.peer_id}")
         async with trio.open_nursery() as nursery:
             while True:
                 try:
+                    print(f"[SWARM_CONN DEBUG] Waiting to accept stream from peer: {self.muxed_conn.peer_id}")
                     stream = await self.muxed_conn.accept_stream()
+                    print(f"[SWARM_CONN DEBUG] Accepted stream from peer: {self.muxed_conn.peer_id}, stream_id: {getattr(stream, 'stream_id', 'unknown')}")
                 except MuxedConnUnavailable:
+                    print(f"[SWARM_CONN DEBUG] MuxedConnUnavailable for peer: {self.muxed_conn.peer_id}, closing connection")
                     await self.close()
                     break
                 # Asynchronously handle the accepted stream, to avoid blocking
@@ -167,6 +171,7 @@ class SwarmConn(INetConn):
                 nursery.start_soon(self._handle_muxed_stream, stream)
 
     async def _handle_muxed_stream(self, muxed_stream: IMuxedStream) -> None:
+        print(f"[SWARM_CONN DEBUG] _handle_muxed_stream called for stream: {getattr(muxed_stream, 'stream_id', 'unknown')}")
         # Acquire inbound stream resource if a manager is configured
         rm = getattr(self.swarm, "_resource_manager", None)
         peer_id_str = str(getattr(self.muxed_conn, "peer_id", ""))
@@ -225,8 +230,13 @@ class SwarmConn(INetConn):
         await self._handle_new_streams()
 
     async def new_stream(self) -> NetStream:
+        print(f"[SWARM_CONN DEBUG] new_stream called for peer: {self.muxed_conn.peer_id}")
+        print(f"[SWARM_CONN DEBUG] Connection is_closed: {self.is_closed}")
         muxed_stream = await self.muxed_conn.open_stream()
-        return await self._add_stream(muxed_stream)
+        print(f"[SWARM_CONN DEBUG] muxed_stream opened: {muxed_stream.stream_id if hasattr(muxed_stream, 'stream_id') else 'unknown'}")
+        result = await self._add_stream(muxed_stream)
+        print(f"[SWARM_CONN DEBUG] Stream added successfully")
+        return result
 
     def get_streams(self) -> tuple[NetStream, ...]:
         return tuple(self.streams)

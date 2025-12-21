@@ -119,21 +119,29 @@ class Multiselect(IMultiselectMuxer):
         :param communicator: communicator to use
         :raise MultiselectError: raised when handshake failed
         """
+        print(f"[MULTISELECT SERVER DEBUG] Starting handshake, writing: {MULTISELECT_PROTOCOL_ID}")
         try:
             await communicator.write(MULTISELECT_PROTOCOL_ID)
+            print(f"[MULTISELECT SERVER DEBUG] Handshake write successful")
         except MultiselectCommunicatorError as error:
+            print(f"[MULTISELECT SERVER DEBUG] Handshake write failed: {error}")
             raise MultiselectError() from error
 
         try:
+            print(f"[MULTISELECT SERVER DEBUG] Reading handshake from client...")
             handshake_contents = await communicator.read()
+            print(f"[MULTISELECT SERVER DEBUG] Handshake received: {handshake_contents!r}")
         except MultiselectCommunicatorError as error:
+            print(f"[MULTISELECT SERVER DEBUG] Handshake read failed: {error}")
             raise MultiselectError() from error
 
         if not is_valid_handshake(handshake_contents):
+            print(f"[MULTISELECT SERVER DEBUG] Invalid handshake: {handshake_contents!r}")
             raise MultiselectError(
                 "multiselect protocol ID mismatch: "
                 f"received handshake_contents={handshake_contents}"
             )
+        print(f"[MULTISELECT SERVER DEBUG] Handshake successful")
 
 
 def is_valid_handshake(handshake_contents: str) -> bool:

@@ -484,11 +484,14 @@ class Yamux(IMuxedConn):
         return self.event_closed.is_set()
 
     async def open_stream(self) -> YamuxStream:
+        print(f"[YAMUX DEBUG] open_stream called for peer: {self.peer_id}")
+        print(f"[YAMUX DEBUG] is_closed: {self.is_closed}, event_shutting_down: {self.event_shutting_down.is_set()}")
         # Wait for backlog slot
         await self.stream_backlog_semaphore.acquire()
         async with self.streams_lock:
             if self.event_shutting_down.is_set():
                 self.stream_backlog_semaphore.release()
+                print(f"[YAMUX DEBUG] Connection shutting down, cannot open stream")
                 raise MuxedStreamError("Connection is shutting down")
             stream_id = self.next_stream_id
             self.next_stream_id += 2
@@ -496,6 +499,7 @@ class Yamux(IMuxedConn):
             self.streams[stream_id] = stream
             self.stream_buffers[stream_id] = bytearray()
             self.stream_events[stream_id] = trio.Event()
+            print(f"[YAMUX DEBUG] Created stream {stream_id} for peer {self.peer_id}")
 
         # If stream is rejected or errors, release the semaphore
         try:
@@ -503,9 +507,12 @@ class Yamux(IMuxedConn):
                 YAMUX_HEADER_FORMAT, 0, TYPE_DATA, FLAG_SYN, stream_id, 0
             )
             logger.debug(f"Sending SYN header for stream {stream_id}")
+            print(f"[YAMUX DEBUG] Sending SYN for stream {stream_id}")
             await self.secured_conn.write(header)
+            print(f"[YAMUX DEBUG] SYN sent successfully for stream {stream_id}")
             return stream
         except Exception as e:
+            print(f"[YAMUX DEBUG] Failed to send SYN for stream {stream_id}: {e}")
             self.stream_backlog_semaphore.release()
             # Clean up stream if SYN fails
             async with self.streams_lock:

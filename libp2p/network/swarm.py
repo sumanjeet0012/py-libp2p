@@ -490,6 +490,7 @@ class Swarm(Service, INetworkService):
         :return: net stream instance
         """
         logger.debug("attempting to open a stream to peer %s", peer_id)
+        print(f"[SWARM DEBUG] new_stream called for peer: {peer_id}")
 
         # Check resource manager for stream limits
         if self._resource_manager is not None:
@@ -499,15 +500,20 @@ class Swarm(Service, INetworkService):
                 str(peer_id), Direction.OUTBOUND
             ):
                 logger.warning("Stream limit exceeded for peer %s", peer_id)
+                print(f"[SWARM DEBUG] Stream limit exceeded for peer {peer_id}")
                 raise SwarmException("Stream limit exceeded")
 
         # Get existing connections or dial new ones
         connections = self.get_connections(peer_id)
+        print(f"[SWARM DEBUG] Got {len(connections) if connections else 0} existing connections for peer {peer_id}")
         if not connections:
+            print(f"[SWARM DEBUG] No existing connections, dialing peer {peer_id}")
             connections = await self.dial_peer(peer_id)
+            print(f"[SWARM DEBUG] Dial completed, got {len(connections) if connections else 0} connections")
 
         # Load balancing strategy at interface level
         connection = self._select_connection(connections, peer_id)
+        print(f"[SWARM DEBUG] Selected connection: {connection}, is_closed: {connection.is_closed if connection else 'N/A'}")
 
         if isinstance(self.transport, QUICTransport) and connection is not None:
             conn = cast("SwarmConn", connection)
@@ -992,11 +998,15 @@ class Swarm(Service, INetworkService):
                 nursery.start_soon(notifee.opened_stream, self, stream)
 
     async def notify_connected(self, conn: INetConn) -> None:
+        print(f"[SWARM DEBUG] notify_connected called for peer: {conn.muxed_conn.peer_id}")
+        print(f"[SWARM DEBUG] Number of notifees: {len(self.notifees)}")
         async with trio.open_nursery() as nursery:
             for notifee in self.notifees:
+                print(f"[SWARM DEBUG] Notifying: {type(notifee).__name__}")
                 nursery.start_soon(notifee.connected, self, conn)
 
     async def notify_disconnected(self, conn: INetConn) -> None:
+        print(f"[SWARM DEBUG] notify_disconnected called for peer: {conn.muxed_conn.peer_id}")
         async with trio.open_nursery() as nursery:
             for notifee in self.notifees:
                 nursery.start_soon(notifee.disconnected, self, conn)

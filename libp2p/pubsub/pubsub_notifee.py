@@ -51,10 +51,13 @@ class PubsubNotifee(INotifee):
         :param network: network the connection was opened on
         :param conn: connection that was opened
         """
+        print(f"[PUBSUB_NOTIFEE DEBUG] connected() called for peer: {conn.muxed_conn.peer_id}")
         try:
             await self.initiator_peers_queue.send(conn.muxed_conn.peer_id)
+            print(f"[PUBSUB_NOTIFEE DEBUG] Peer {conn.muxed_conn.peer_id} added to initiator_peers_queue")
         except trio.BrokenResourceError:
             # The receive channel is closed by Pubsub. We should do nothing here.
+            print(f"[PUBSUB_NOTIFEE DEBUG] BrokenResourceError - channel closed for peer {conn.muxed_conn.peer_id}")
             pass
 
     async def disconnected(self, network: INetwork, conn: INetConn) -> None:
@@ -65,10 +68,13 @@ class PubsubNotifee(INotifee):
         :param network: network the connection was opened on
         :param conn: connection that was opened
         """
+        print(f"[PUBSUB_NOTIFEE DEBUG] disconnected() called for peer: {conn.muxed_conn.peer_id}")
         try:
             await self.dead_peers_queue.send(conn.muxed_conn.peer_id)
+            print(f"[PUBSUB_NOTIFEE DEBUG] Peer {conn.muxed_conn.peer_id} added to dead_peers_queue")
         except trio.BrokenResourceError:
             # The receive channel is closed by Pubsub. We should do nothing here.
+            print(f"[PUBSUB_NOTIFEE DEBUG] BrokenResourceError - channel closed for dead peer {conn.muxed_conn.peer_id}")
             pass
 
     async def listen(self, network: INetwork, multiaddr: Multiaddr) -> None:

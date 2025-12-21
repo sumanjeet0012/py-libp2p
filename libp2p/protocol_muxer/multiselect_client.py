@@ -36,23 +36,31 @@ class MultiselectClient(IMultiselectClient):
         :param communicator: communicator to use to communicate with counterparty
         :raise MultiselectClientError: raised when handshake failed
         """
+        print(f"[MULTISELECT_CLIENT DEBUG] Starting handshake, writing: {MULTISELECT_PROTOCOL_ID}")
         try:
             await communicator.write(MULTISELECT_PROTOCOL_ID)
+            print(f"[MULTISELECT_CLIENT DEBUG] Handshake write successful")
         except MultiselectCommunicatorError as error:
+            print(f"[MULTISELECT_CLIENT DEBUG] Handshake write failed: {error}")
             raise MultiselectClientError(f"handshake write failed: {error}") from error
 
         try:
+            print(f"[MULTISELECT_CLIENT DEBUG] Reading handshake response...")
             handshake_contents = await communicator.read()
+            print(f"[MULTISELECT_CLIENT DEBUG] Handshake response received: {handshake_contents!r}")
 
         except MultiselectCommunicatorError as error:
+            print(f"[MULTISELECT_CLIENT DEBUG] Handshake read failed: {error}")
             raise MultiselectClientError(f"handshake read failed: {error}") from error
 
         if not is_valid_handshake(handshake_contents):
+            print(f"[MULTISELECT_CLIENT DEBUG] Invalid handshake response: {handshake_contents!r}")
             raise MultiselectClientError(
                 f"multiselect protocol ID mismatch: "
                 f"expected {MULTISELECT_PROTOCOL_ID}, "
                 f"got {handshake_contents!r}"
             )
+        print(f"[MULTISELECT_CLIENT DEBUG] Handshake successful")
 
     async def select_one_of(
         self,
