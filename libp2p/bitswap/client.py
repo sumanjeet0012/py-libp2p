@@ -292,12 +292,12 @@ class BitswapClient:
             )
             error.__cause__ = e
         finally:
-            # Cleanup
-            await self.cancel_want(cid)
-            if cid in self._pending_requests:
-                del self._pending_requests[cid]
-            if cid in self._dont_have_responses:
-                del self._dont_have_responses[cid]
+            # Cleanup - use pop() to safely remove without KeyError races.
+            # Avoid calling cancel_want() here as it broadcasts cancel messages
+            # (opening new streams/yield points) while other tasks may be running.
+            self._wantlist.pop(cid, None)
+            self._pending_requests.pop(cid, None)
+            self._dont_have_responses.pop(cid, None)
 
         if error:
             raise error
@@ -382,7 +382,7 @@ class BitswapClient:
 
     async def _broadcast_wantlist(self, cids: list[bytes]) -> None:
         """Broadcast wantlist to all connected peers."""
-        peers = self.host.get_network().connections.keys()
+        peers = list(self.host.get_network().connections.keys())
         for peer_id in peers:
             if self._nursery:
                 self._nursery.start_soon(self._send_wantlist_to_peer, peer_id, cids)
@@ -394,7 +394,7 @@ class BitswapClient:
         entry = create_wantlist_entry(cid, cancel=True)
         msg = create_message(wantlist_entries=[entry])
 
-        peers = self.host.get_network().connections.keys()
+        peers = list(self.host.get_network().connections.keys())
         for peer_id in peers:
             try:
                 stream = await self.host.new_stream(
@@ -409,10 +409,11 @@ class BitswapClient:
         """Notify peers who wanted this block."""
         peers_to_notify = []
 
-        # Find peers who want this block
-        for peer_id, wantlist in self._peer_wantlists.items():
+        # Find peers who want this block (snapshot to avoid mutation during
+        # iteration)
+        for peer_id, wantlist in list(self._peer_wantlists.items()):
             if cid in wantlist:
-                want_info = wantlist[cid]
+                want_info = dict(wantlist[cid])  # copy to avoid reference issues
                 peers_to_notify.append((peer_id, want_info))
 
         # Send block or presence to interested peers
@@ -499,7 +500,8 @@ class BitswapClient:
             # Clean up expected blocks for this peer
             if peer_id in self._expected_blocks:
                 peer_id_str = str(peer_id)
-                remaining = len(self._expected_blocks[peer_id])
+                remaining_cids = list(self._expected_blocks.get(peer_id, set()))
+                remaining = len(remaining_cids)
                 if remaining > 0:
                     logger.error("")
                     logger.error("=" * 70)
@@ -507,11 +509,11 @@ class BitswapClient:
                     logger.error("=" * 70)
                     logger.error(f"Peer: {peer_id_str}")
                     logger.error(f"Missing {remaining} blocks:")
-                    for i, cid in enumerate(self._expected_blocks[peer_id]):
+                    for i, cid in enumerate(remaining_cids):
                         logger.error(f"  {i + 1}. {cid.hex()}")
                     logger.error("=" * 70)
                     logger.error("")
-                del self._expected_blocks[peer_id]
+                self._expected_blocks.pop(peer_id, None)
             try:
                 await stream.close()
             except Exception as e:
@@ -684,8 +686,8 @@ class BitswapClient:
                 logger.info("  ✓ Stored successfully")
 
                 # Remove from expected blocks for all peers
-                for pid in self._expected_blocks:
-                    if matched_cid in self._expected_blocks[pid]:
+                for pid in list(self._expected_blocks):
+                    if pid in self._expected_blocks and matched_cid in self._expected_blocks[pid]:
                         self._expected_blocks[pid].discard(matched_cid)
                         pid_str = (
                             str(pid)[:16] if hasattr(pid, "__str__") else "unknown"
@@ -710,10 +712,10 @@ class BitswapClient:
         logger.info("")
         logger.info("=" * 70)
         logger.info("Block processing complete. Remaining expected blocks:")
-        remaining = self._expected_blocks.get(peer_id, set())
+        remaining = set(self._expected_blocks.get(peer_id, set()))
         if remaining:
             logger.warning(f"  Still waiting for {len(remaining)} blocks:")
-            for i, cid in enumerate(remaining):
+            for i, cid in enumerate(list(remaining)):
                 logger.warning(f"    {i + 1}. {cid.hex()}")
         else:
             logger.info("  ✓ All blocks received from this peer!")
@@ -734,8 +736,9 @@ class BitswapClient:
             logger.debug(f"Received and stored block {cid.hex()[:16]}... (v1.1.0+)")
 
             # Remove from expected blocks for all peers
-            for peer_id in self._expected_blocks:
-                self._expected_blocks[peer_id].discard(cid)
+            for peer_id in list(self._expected_blocks):
+                if peer_id in self._expected_blocks:
+                    self._expected_blocks[peer_id].discard(cid)
 
             # Notify pending requests
             if cid in self._pending_requests:

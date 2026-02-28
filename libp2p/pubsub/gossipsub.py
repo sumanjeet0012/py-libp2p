@@ -560,7 +560,8 @@ class GossipSub(IPubsubRouter, Service):
         if topic not in self.mesh:
             return
         # Notify the peers in mesh[topic] with a PRUNE(topic) message
-        for peer in self.mesh[topic]:
+        # (snapshot to avoid mutation during iteration with await yield points)
+        for peer in list(self.mesh.get(topic, set())):
             # Add backoff BEFORE emitting PRUNE to avoid races where a GRAFT
             # could be processed before the backoff is recorded locally.
             self._add_back_off(peer, topic, True)

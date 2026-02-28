@@ -477,8 +477,9 @@ class Pubsub(Service, IPubsub):
             except Exception:
                 pass
             del self.peers[peer_id]
-        # Also remove from any subscription maps:
-        for _topic, peerset in self.peer_topics.items():
+        # Also remove from any subscription maps (snapshot to avoid mutation
+        # during iteration):
+        for _topic, peerset in list(self.peer_topics.items()):
             if peer_id in peerset:
                 peerset.discard(peer_id)
 
@@ -602,8 +603,8 @@ class Pubsub(Service, IPubsub):
             return
         del self.peers[peer_id]
 
-        for topic in self.peer_topics:
-            if peer_id in self.peer_topics[topic]:
+        for topic in list(self.peer_topics):
+            if peer_id in self.peer_topics.get(topic, set()):
                 self.peer_topics[topic].discard(peer_id)
 
         self.router.remove_peer(peer_id)
@@ -772,15 +773,21 @@ class Pubsub(Service, IPubsub):
 
         :param raw_msg: raw contents of the message to broadcast
         """
-        # Broadcast message
-        for stream in self.peers.values():
+        # Snapshot peers to avoid "dictionary changed size during iteration".
+        # _handle_dead_peer() deletes from self.peers, and await is a yield
+        # point where other tasks can also mutate the dict.
+        dead_peers: list = []
+        for stream in list(self.peers.values()):
             # Write message to stream
             try:
                 await stream.write(encode_varint_prefixed(raw_msg))
             except StreamClosed:
                 peer_id = stream.muxed_conn.peer_id
                 logger.debug("Fail to message peer %s: stream closed", peer_id)
-                self._handle_dead_peer(peer_id)
+                dead_peers.append(peer_id)
+        # Handle dead peers after iteration is complete
+        for peer_id in dead_peers:
+            self._handle_dead_peer(peer_id)
 
     async def publish(self, topic_id: str | list[str], data: bytes) -> None:
         """

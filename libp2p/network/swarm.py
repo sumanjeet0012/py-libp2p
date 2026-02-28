@@ -264,9 +264,10 @@ class Swarm(Service, INetworkService):
         if peer_id is not None:
             return self.connections.get(peer_id, [])
 
-        # Return all connections from all peers
+        # Return all connections from all peers (snapshot to avoid mutation
+        # during iteration)
         all_conns = []
-        for conns in self.connections.values():
+        for conns in list(self.connections.values()):
             all_conns.extend(conns)
         return all_conns
 
@@ -1701,7 +1702,7 @@ class Swarm(Service, INetworkService):
 
         """
         legacy_conns = {}
-        for peer_id, conns in self.connections.items():
+        for peer_id, conns in list(self.connections.items()):
             if conns:
                 legacy_conns[peer_id] = conns[0]
         return legacy_conns
