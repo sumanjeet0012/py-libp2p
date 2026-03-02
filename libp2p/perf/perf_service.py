@@ -193,9 +193,17 @@ class PerfService(IPerf):
         upload_start = time.time()
 
         try:
-            # Send the number of bytes we want to receive (as big-endian u64)
+            # Send the number of bytes we want to receive (as big-endian u64).
+            # When there is no upload data (send_bytes == 0), bundle FIN with
+            # the header so the listener sees EOF immediately without waiting.
+            # This avoids the close_write() retry loop (up to 40 × 5 ms sleeps)
+            # that polls for the FIN ACK and would otherwise inflate the
+            # measured download time.
             header = struct.pack(">Q", recv_bytes)
-            await stream.write(header)
+            if send_bytes == 0:
+                await stream.write(header, end_stream=True)  # type: ignore[call-arg]
+            else:
+                await stream.write(header)
 
             logger.debug("Sending %d bytes to %s", send_bytes, peer_id)
 

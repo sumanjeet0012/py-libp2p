@@ -138,8 +138,11 @@ class QUICTransport(ITransport):
                 is_client=False,
                 alpn_protocols=get_alpn_protocols(),
                 verify_mode=self._config.verify_mode,
+                max_datagram_size=self._config.max_datagram_size,
                 max_datagram_frame_size=self._config.max_datagram_size,
                 idle_timeout=self._config.idle_timeout,
+                max_data=self._config.connection_window,
+                max_stream_data=self._config.stream_window,
             )
 
             # Base client configuration
@@ -147,8 +150,11 @@ class QUICTransport(ITransport):
                 is_client=True,
                 alpn_protocols=get_alpn_protocols(),
                 verify_mode=self._config.verify_mode,
+                max_datagram_size=self._config.max_datagram_size,
                 max_datagram_frame_size=self._config.max_datagram_size,
                 idle_timeout=self._config.idle_timeout,
+                max_data=self._config.connection_window,
+                max_stream_data=self._config.stream_window,
             )
 
             # Apply TLS configuration

@@ -64,7 +64,7 @@ class QUICTransportConfig(ConnectionConfig):
     # Connection settings
     idle_timeout: float = 30.0  # Seconds before an idle connection is closed.
     max_datagram_size: int = (
-        1200  # Maximum size of UDP datagrams to avoid IP fragmentation.
+        1350  # Maximum size of UDP datagrams. 1350 is safe for Docker/loopback.
     )
     local_port: int | None = (
         None  # Local port to bind to. If None, a random port is chosen.
@@ -80,8 +80,8 @@ class QUICTransportConfig(ConnectionConfig):
 
     # Performance settings
     max_concurrent_streams: int = 100  # Maximum concurrent streams per connection
-    connection_window: int = 1024 * 1024  # Connection flow control window
-    stream_window: int = 64 * 1024  # Stream flow control window
+    connection_window: int = 16 * 1024 * 1024  # Connection flow control window (16 MB)
+    stream_window: int = 4 * 1024 * 1024  # Stream flow control window (4 MB per stream)
 
     # Logging and debugging
     enable_qlog: bool = False  # Enable QUIC logging

@@ -193,11 +193,12 @@ class QUICConnection(IRawConnection, IMuxedConn):
         # Starts at 0 for initial CID, increments for each new CID issued
         self._connection_id_sequence_counter: int = 0
 
-        # Event processing control with batching
-        self._event_processing_active: bool = False
+        # Event processing state
         self._event_batch: list[events.QuicEvent] = []
-        self._event_batch_size: int = 10
-        self._last_event_time: float = 0.0
+        # Set by notify_packet_arrived() (called from the listener whenever
+        # receive_datagram is fed a new UDP packet) so that _event_processing_loop
+        # can wake up immediately instead of busy-polling with a fixed sleep.
+        self._packet_available: trio.Event = trio.Event()
 
         # Set quic connection configuration
         self.CONNECTION_CLOSE_TIMEOUT = self._transport._config.CONNECTION_CLOSE_TIMEOUT
@@ -471,6 +472,18 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         logger.debug("Started background tasks for QUIC connection")
 
+    def notify_packet_arrived(self) -> None:
+        """
+        Signal that a new UDP packet has been fed to ``_quic.receive_datagram``.
+
+        Called synchronously by the listener (or the client receiver) right
+        after delivering a datagram so that ``_event_processing_loop`` can wake
+        up immediately rather than waiting for the next fixed-sleep interval.
+        This is the main lever that reduces round-trip latency from ~1 ms to
+        near-zero on the server side.
+        """
+        self._packet_available.set()
+
     async def _event_processing_loop(self) -> None:
         """Main event processing loop for the connection."""
         logger.debug(
@@ -479,9 +492,8 @@ class QUICConnection(IRawConnection, IMuxedConn):
         )
 
         try:
-            consecutive_idle_iterations = 0
             while not self._closed:
-                # Batch process events - returns True if events were processed
+                # Process all pending events immediately.
                 events_processed = await self._process_quic_events_batched()
 
                 # Handle timer events
@@ -490,20 +502,29 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 # Transmit any pending data
                 await self._transmit()
 
-                # Adaptive sleep based on activity
-                # When processing events: use minimal sleep (just yield) for low latency
-                # When idle: use longer sleep to reduce CPU usage
-                if not events_processed:
-                    consecutive_idle_iterations += 1
-                    # Use longer sleep when idle to reduce CPU usage
-                    # Start with 1ms, increase to 10ms after several idle iterations
-                    sleep_time = 0.01 if consecutive_idle_iterations > 5 else 0.001
-                    await trio.sleep(sleep_time)
+                if events_processed:
+                    # We did useful work; yield to other tasks but come back fast.
+                    await trio.sleep(0)
                 else:
-                    consecutive_idle_iterations = 0
-                    # Minimal sleep when processing events - just yield to allow
-                    # other tasks to run, but keep latency low
-                    await trio.sleep(0)  # Yield without sleeping
+                    # Nothing to do right now.  Sleep until the earlier of:
+                    #   (a) the next aioquic timer fires, or
+                    #   (b) a new UDP packet arrives via notify_packet_arrived().
+                    # This eliminates the fixed 1 ms poll that was the dominant
+                    # source of latency on the server side (where packets feed
+                    # receive_datagram but no separate receiver task exists).
+                    timer = self._quic.get_timer()
+                    now = time.time()
+                    if timer is not None:
+                        timeout = max(0.0, timer - now)
+                    else:
+                        timeout = 1.0  # maximum idle wait
+
+                    packet_event = self._packet_available
+                    with trio.move_on_after(timeout):
+                        await packet_event.wait()
+                    # Whether we timed out or a packet woke us up, reset the
+                    # event so the next idle period starts clean.
+                    self._packet_available = trio.Event()
 
         except Exception as e:
             logger.error(f"Error in event processing loop: {e}")
@@ -941,69 +962,70 @@ class QUICConnection(IRawConnection, IMuxedConn):
     # Batched event processing to reduce overhead
     async def _process_quic_events_batched(self) -> bool:
         """
-        Process QUIC events in batches for better performance.
+        Process all pending QUIC events immediately.
+
+        Every call drains the entire aioquic event queue so that stream data
+        is delivered to the application without artificial delay.  The old
+        "collect 10 events OR wait 10 ms" gate has been removed: it was
+        introducing up to 10 ms of per-batch latency which compounded over
+        download iterations and caused throughput to degrade 8× by the 4th
+        download measurement.
+
+        Concurrency note: both ``_client_packet_receiver`` and
+        ``_event_processing_loop`` call this method.  To prevent the same
+        event from being processed twice (which would corrupt the receive
+        buffer), we swap ``self._event_batch`` for a fresh empty list *before*
+        entering the async ``_process_event_batch`` call.  Any events that
+        arrive during processing are appended to the new list and will be
+        handled by the next call.
 
         Returns:
-            True if events were processed, False if no events available
+            True if at least one event was processed, False if the queue was
+            empty.
 
         """
-        if self._event_processing_active:
-            return False  # Prevent recursion
+        # Drain *all* currently available events in one pass.
+        while True:
+            event = self._quic.next_event()
+            if event is None:
+                break
+            self._event_batch.append(event)
 
-        self._event_processing_active = True
-        result = False  # Default to False if no events processed
-
-        try:
-            current_time = time.time()
-            events_processed = 0
-
-            # Collect events into batch
-            while events_processed < self._event_batch_size:
-                event = self._quic.next_event()
-                if event is None:
-                    break
-
-                self._event_batch.append(event)
-                events_processed += 1
-
-            # Process batch if we have events or timeout
-            if self._event_batch and (
-                len(self._event_batch) >= self._event_batch_size
-                or current_time - self._last_event_time > 0.01  # 10ms timeout
-            ):
-                await self._process_event_batch()
-                self._event_batch.clear()
-                self._last_event_time = current_time
-                result = True
-        finally:
-            self._event_processing_active = False
-
-        return result
-
-    async def _process_event_batch(self) -> None:
-        """Process a batch of events efficiently."""
         if not self._event_batch:
+            return False
+
+        # Swap out the batch *before* the first await so that a concurrent
+        # caller cannot observe the same events and process them a second time.
+        batch = self._event_batch
+        self._event_batch = []
+
+        await self._process_event_batch_for(batch)
+        return True
+
+    async def _process_event_batch_for(
+        self, batch: "list[events.QuicEvent]"
+    ) -> None:
+        """Process an already-extracted event batch (see _process_quic_events_batched)."""
+        if not batch:
             return
 
         # Group events by type for batch processing where possible
-        events_by_type: defaultdict[str, list[QuicEvent]] = defaultdict(list)
-        for event in self._event_batch:
+        events_by_type: defaultdict[str, list[events.QuicEvent]] = defaultdict(list)
+        for event in batch:
             events_by_type[type(event).__name__].append(event)
 
         # Process events by type
         for event_type, event_list in events_by_type.items():
             if event_type == type(events.StreamDataReceived).__name__:
-                # Filter to only StreamDataReceived events
                 stream_data_events = [
                     e for e in event_list if isinstance(e, events.StreamDataReceived)
                 ]
                 await self._handle_stream_data_batch(stream_data_events)
             else:
-                # Process other events individually
                 for event in event_list:
                     await self._handle_quic_event(event)
 
-        logger.debug(f"Processed batch of {len(self._event_batch)} events")
+        logger.debug(f"Processed batch of {len(batch)} events")
 
     async def _handle_stream_data_batch(
         self, events_list: list[events.StreamDataReceived]

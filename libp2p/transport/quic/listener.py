@@ -699,6 +699,10 @@ class QUICListener(IListener):
         try:
             # Feed data to the connection's QUIC instance
             connection._quic.receive_datagram(data, addr, now=time.time())
+            # Wake up the connection's _event_processing_loop immediately so it
+            # processes the new events without waiting for the next idle-sleep
+            # interval (was up to 1 ms, the dominant RTT component).
+            connection.notify_packet_arrived()
             # NOTE: Established connections process events and transmit in their own
             # event loop. Avoid double-consuming `next_event()` here.
 

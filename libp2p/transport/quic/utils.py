@@ -311,6 +311,7 @@ def create_server_config_from_base(
         copyable_attrs = [
             "alpn_protocols",
             "verify_mode",
+            "max_datagram_size",
             "max_datagram_frame_size",
             "idle_timeout",
             "max_concurrent_streams",
@@ -401,6 +402,7 @@ def create_client_config_from_base(
         copyable_attrs = [
             "alpn_protocols",
             "verify_mode",
+            "max_datagram_size",
             "max_datagram_frame_size",
             "idle_timeout",
             "max_concurrent_streams",
