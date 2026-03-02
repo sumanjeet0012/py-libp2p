@@ -122,12 +122,19 @@ class PerfService(IPerf):
                 except Exception:
                     break
 
-            # Send back the requested number of bytes
-            while bytes_to_send_back > 0:
-                to_send = min(self._write_block_size, bytes_to_send_back)
-                await stream.write(self._buf[:to_send])
-                bytes_to_send_back -= to_send
-
+            # Send back the requested number of bytes, bundling the FIN with
+            # the last data chunk to avoid the QUIC zombie-FIN bug where a
+            # standalone FIN-only STREAM frame can be silently lost when the
+            # congestion window is saturated.
+            if bytes_to_send_back > 0:
+                while bytes_to_send_back > 0:
+                    to_send = min(self._write_block_size, bytes_to_send_back)
+                    bytes_to_send_back -= to_send
+                    is_last = bytes_to_send_back == 0
+                    await stream.write(self._buf[:to_send], end_stream=is_last)  # type: ignore[call-arg]
+                # FIN was bundled with the last data write; QUICStream.write()
+                # already set _write_closed=True, so stream.close() below will
+                # skip close_write() and only close the read side.
             await stream.close()
 
         except Exception as e:
@@ -192,35 +199,40 @@ class PerfService(IPerf):
 
             logger.debug("Sending %d bytes to %s", send_bytes, peer_id)
 
-            # Upload phase
-            bytes_remaining = send_bytes
-            while bytes_remaining > 0:
-                to_send = min(self._write_block_size, bytes_remaining)
-                await stream.write(self._buf[:to_send])
-                bytes_remaining -= to_send
-                last_amount_of_bytes_sent += to_send
-                total_bytes_sent += to_send
+            # Upload phase — bundle FIN with the last data chunk to avoid the
+            # QUIC zombie-FIN bug (a standalone FIN-only frame can be silently
+            # lost when the congestion window is saturated).
+            if send_bytes > 0:
+                bytes_remaining = send_bytes
+                while bytes_remaining > 0:
+                    to_send = min(self._write_block_size, bytes_remaining)
+                    bytes_remaining -= to_send
+                    is_last = bytes_remaining == 0
+                    await stream.write(self._buf[:to_send], end_stream=is_last)  # type: ignore[call-arg]
+                    last_amount_of_bytes_sent += to_send
+                    total_bytes_sent += to_send
 
-                # Yield intermediary progress every second
-                if time.time() - last_reported_time > 1.0:
-                    yield PerfOutput(
-                        type="intermediary",
-                        time_seconds=time.time() - last_reported_time,
-                        upload_bytes=last_amount_of_bytes_sent,
-                        download_bytes=0,
-                    )
-                    last_reported_time = time.time()
-                    last_amount_of_bytes_sent = 0
+                    # Yield intermediary progress every second
+                    if time.time() - last_reported_time > 1.0:
+                        yield PerfOutput(
+                            type="intermediary",
+                            time_seconds=time.time() - last_reported_time,
+                            upload_bytes=last_amount_of_bytes_sent,
+                            download_bytes=0,
+                        )
+                        last_reported_time = time.time()
+                        last_amount_of_bytes_sent = 0
+                # FIN was bundled with the last write for QUIC; for other
+                # muxers the write() call ignores end_stream so we still need
+                # close_write() to send the FIN.
+            # Always call close_write() — it is a no-op for QUIC when
+            # _write_closed was already set by write(end_stream=True).
+            if hasattr(stream, "close_write"):
+                await stream.close_write()  # type: ignore[attr-defined]
 
             logger.debug(
                 "Upload complete after %.3f ms", (time.time() - upload_start) * 1000
             )
-
-            # Close the write side to signal we're done sending
-            # Note: close_write() is available on NetStream
-            # but not on INetStream interface
-            if hasattr(stream, "close_write"):
-                await stream.close_write()  # type: ignore[attr-defined]
 
             # Download phase
             last_amount_of_bytes_received = 0

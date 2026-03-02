@@ -237,11 +237,17 @@ class NetStream(INetStream):
             # Re-raise known exceptions as-is
             raise
 
-    async def write(self, data: bytes) -> None:
+    async def write(self, data: bytes, end_stream: bool = False) -> None:
         """
         Write to stream.
 
         :param data: bytes to write
+        :param end_stream: If True, also close the write side (send FIN bundled
+            with the data).  Supported by QUIC streams; for other muxers the
+            FIN is sent via a separate close_write() call after the write.
+            Bundling FIN with the last data frame avoids the aioquic zombie-FIN
+            bug where a standalone FIN-only frame can be silently lost when the
+            congestion window is saturated.
         """
         # Check state atomically to prevent race conditions
         async with self._state_lock:
@@ -254,7 +260,26 @@ class NetStream(INetStream):
 
         # Perform I/O operation without holding the lock to prevent deadlocks
         try:
-            await self.muxed_stream.write(data)
+            # Propagate end_stream to the underlying muxed stream when supported
+            # (QUICStream.write accepts end_stream=True to bundle FIN with data).
+            # For other muxers (yamux, mplex) end_stream is ignored here — the
+            # caller is responsible for sending the FIN via close_write() /
+            # close() as usual.  This avoids double-close races on yamux/mplex.
+            if end_stream:
+                try:
+                    await self.muxed_stream.write(data, end_stream=True)
+                    # FIN was bundled with data; update write state.
+                    async with self._state_lock:
+                        if self._state == StreamState.CLOSE_READ:
+                            self._state = StreamState.CLOSE_BOTH
+                        elif self._state == StreamState.OPEN:
+                            self._state = StreamState.CLOSE_WRITE
+                except TypeError:
+                    # Muxer doesn't support end_stream kwarg (yamux, mplex);
+                    # write data normally and let the caller send the FIN.
+                    await self.muxed_stream.write(data)
+            else:
+                await self.muxed_stream.write(data)
         except (
             MuxedStreamClosed,
             QUICStreamClosedError,
