@@ -829,8 +829,6 @@ class QUICListener(IListener):
                 elif isinstance(event, events.StreamDataReceived):
                     # For pending connections, if handshake is complete, we should
                     # have already promoted. But if we get here, promote now.
-                    # Don't process stream data events here - let the connection's
-                    # event loop handle them
                     (
                         connection_obj,
                         pending_conn,
@@ -839,9 +837,19 @@ class QUICListener(IListener):
                         destination_connection_id
                     )
                     if connection_obj:
-                        # Don't process here - the connection's event loop
-                        # will handle it
-                        pass
+                        # The event was already consumed from aioquic's queue via
+                        # next_event() above.  If the connection was just promoted
+                        # in the same iteration (e.g. by a preceding
+                        # HandshakeCompleted event), its event-processing loop has
+                        # NOT yet seen this event.  Forward it so the connection
+                        # can create the inbound QUICStream and route data to the
+                        # waiting protocol handler.
+                        try:
+                            await connection_obj._handle_quic_event(event)
+                        except Exception as e:
+                            logger.debug(
+                                f"Error forwarding StreamDataReceived to connection: {e}"
+                            )
                     elif is_pending and pending_conn:
                         if quic_conn._handshake_complete:
                             await self._promote_pending_connection(
@@ -1215,8 +1223,11 @@ class QUICListener(IListener):
             self._socket = await self._create_socket(host, port)
             self._nursery = active_nursery
 
-            # Get the actual bound address
-            bound_host, bound_port = self._socket.getsockname()
+            # Get the actual bound address.
+            # getsockname() returns a 2-tuple for IPv4 but a 4-tuple for IPv6
+            # (host, port, flowinfo, scope_id), so unpack only the first two.
+            sockname = self._socket.getsockname()
+            bound_host, bound_port = sockname[0], sockname[1]
             quic_version = multiaddr_to_quic_version(maddr)
             bound_maddr = create_quic_multiaddr(bound_host, bound_port, quic_version)
             self._bound_addresses = [bound_maddr]

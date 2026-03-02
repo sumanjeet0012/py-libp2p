@@ -70,6 +70,12 @@ HEADER_SIZE = 12
 # Network byte order: version (B), type (B), flags (H), stream_id (I), length (I)
 YAMUX_HEADER_FORMAT = "!BBHII"
 DEFAULT_WINDOW_SIZE = 256 * 1024
+# Noise protocol maximum encrypted message size is 65535 bytes.
+# Each Yamux DATA frame is header + payload, and Noise adds a 16-byte MAC,
+# so: HEADER_SIZE + payload + NOISE_MAC (16) <= 65535
+# => payload <= 65535 - HEADER_SIZE - 16 = 65507 bytes
+NOISE_MAC_SIZE = 16
+MAX_NOISE_PAYLOAD = 65535 - HEADER_SIZE - NOISE_MAC_SIZE  # 65507 bytes
 
 GO_AWAY_NORMAL = 0x0
 GO_AWAY_PROTOCOL_ERROR = 0x1
@@ -89,6 +95,7 @@ class YamuxStream(IMuxedStream):
         self.send_window = DEFAULT_WINDOW_SIZE
         self.recv_window = DEFAULT_WINDOW_SIZE
         self.window_lock = trio.Lock()
+        self._window_updated: trio.Event = trio.Event()
         self.rw_lock = ReadWriteLock()
         self.close_lock = trio.Lock()
 
@@ -123,15 +130,16 @@ class YamuxStream(IMuxedStream):
                             f"Stream {self.stream_id}: "
                             "Window is zero, waiting for update"
                         )
-                        # Release lock and wait with timeout
+                        # Arm a fresh event under the lock so we can't miss a
+                        # window-update that arrives between releasing and waiting.
+                        self._window_updated = trio.Event()
+                        window_event = self._window_updated
                         self.window_lock.release()
-                        # To avoid re-acquiring the lock immediately,
                         with trio.move_on_after(5.0) as cancel_scope:
-                            while self.send_window == 0 and not self.closed:
-                                await trio.sleep(0.01)
-                            # If we timed out, cancel the scope
-                            timeout = cancel_scope.cancelled_caught
-                        # Re-acquire lock
+                            await window_event.wait()
+                        # Read cancelled_caught OUTSIDE the with-block so it is
+                        # always set, even when the scope cancels the await.
+                        timeout = cancel_scope.cancelled_caught
                         await self.window_lock.acquire()
 
                     # If we timed out waiting for window update, raise an error
@@ -143,8 +151,10 @@ class YamuxStream(IMuxedStream):
                     if self.closed:
                         raise MuxedStreamError("Stream is closed")
 
-                    # Calculate how much we can send now
-                    to_send = min(self.send_window, total_len - sent)
+                    # Calculate how much we can send now.
+                    # MAX_NOISE_PAYLOAD caps each frame so that header+payload
+                    # never exceeds the Noise protocol 65535-byte message limit.
+                    to_send = min(self.send_window, total_len - sent, MAX_NOISE_PAYLOAD)
                     chunk = data[sent : sent + to_send]
                     self.send_window -= to_send
 
@@ -359,6 +369,7 @@ class YamuxStream(IMuxedStream):
                     logger.debug(f"Error sending FIN, connection likely closed: {e}")
                 finally:
                     self.send_closed = True
+                    self._window_updated.set()  # unblock any writer waiting on flow control
 
             # Only set fully closed if both directions are closed
             if self.send_closed and self.recv_closed:
@@ -383,6 +394,7 @@ class YamuxStream(IMuxedStream):
                     self.send_closed = True
                     self.recv_closed = True
                     self.reset_received = True  # Mark as reset
+                    self._window_updated.set()  # unblock any writer waiting on flow control
 
     def set_deadline(self, ttl: int) -> bool:
         """
@@ -973,6 +985,7 @@ class Yamux(IMuxedConn):
                                     f" increment: {increment}"
                                 )
                                 stream.send_window += increment
+                                stream._window_updated.set()
 
                             # Check for FIN/RST flags on WINDOW_UPDATE
                             if flags & FLAG_FIN:

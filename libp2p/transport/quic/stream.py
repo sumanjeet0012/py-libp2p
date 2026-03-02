@@ -267,12 +267,16 @@ class QUICStream(IMuxedStream):
             await self._handle_stream_error(e)
             raise
 
-    async def write(self, data: bytes) -> None:
+    async def write(self, data: bytes, end_stream: bool = False) -> None:
         """
         Write data to the stream with QUIC flow control.
 
         Args:
             data: Data to write
+            end_stream: If True, also close the write side (send FIN with data).
+                        Combining data and FIN in a single frame avoids a known
+                        aioquic issue where a standalone FIN-only frame can be
+                        silently discarded when the congestion window is full.
 
         Raises:
             QUICStreamClosedError: Stream is closed for writing
@@ -280,7 +284,7 @@ class QUICStream(IMuxedStream):
             QUICStreamResetError: Stream was reset
 
         """
-        if not data:
+        if not data and not end_stream:
             return
 
         async with self._state_lock:
@@ -296,12 +300,27 @@ class QUICStream(IMuxedStream):
             # Handle flow control backpressure
             await self._backpressure_event.wait()
 
-            # Send data through QUIC connection
-            self._connection._quic.send_stream_data(self._stream_id, data)
+            # Send data through QUIC connection, optionally with FIN flag.
+            # Passing end_stream=True here bundles the FIN with the data frame,
+            # ensuring reliable delivery even when congestion window is tight.
+            self._connection._quic.send_stream_data(
+                self._stream_id, data, end_stream=end_stream
+            )
             await self._connection._transmit()
 
+            if end_stream:
+                self._write_closed = True
+                async with self._state_lock:
+                    if self._read_closed:
+                        self._state = StreamState.CLOSED
+                    else:
+                        self._state = StreamState.WRITE_CLOSED
+
             self._timeline.record_first_data()
-            logger.debug(f"Wrote {len(data)} bytes to stream {self.stream_id}")
+            logger.debug(
+                f"Wrote {len(data)} bytes to stream {self.stream_id}"
+                + (" (FIN)" if end_stream else "")
+            )
 
         except Exception as e:
             logger.error(f"Error writing to stream {self.stream_id}: {e}")
@@ -341,16 +360,68 @@ class QUICStream(IMuxedStream):
         logger.debug(f"Stream {self.stream_id} closed")
 
     async def close_write(self) -> None:
-        """Close the write side of the stream."""
+        """
+        Close the write side of the stream by sending a QUIC FIN.
+
+        Works around a known aioquic issue where a FIN-only STREAM frame can be
+        silently lost when the congestion window is saturated: ``get_frame()``
+        clears ``_pending_eof`` before ``start_frame()`` checks whether the
+        frame fits, and if the builder raises ``QuicPacketBuilderStop`` the FIN
+        state is corrupted (``_pending_eof=False`` but frame never sent).
+
+        Mitigation: after calling ``send_stream_data`` we poll aioquic's internal
+        sender state and re-queue the FIN whenever we detect the zombie condition.
+        We then retry ``_transmit()`` (with brief sleeps so the pacing timer can
+        advance) until the FIN has actually been included in a sent datagram or
+        until it has been ACK-ed by the peer.
+        """
         if self._write_closed:
             return
 
+        logger.debug(f"close_write called on stream {self._stream_id}")
+
         try:
-            # Send FIN to close write side
+            # Queue FIN in aioquic's sender buffer.
             self._connection._quic.send_stream_data(
                 self._stream_id, b"", end_stream=True
             )
-            await self._connection._transmit()
+
+            # Transmit with zombie-FIN detection and retry.
+            _MAX_RETRIES = 40
+            _RETRY_SLEEP = 0.005  # 5 ms between retries
+            for attempt in range(_MAX_RETRIES):
+                await self._connection._transmit()
+
+                # Check if the FIN has been ACKed (happy path — done).
+                quic_stream = self._connection._quic._streams.get(self._stream_id)
+                if quic_stream is None or quic_stream.sender._acked_fin:
+                    break
+
+                # Detect the zombie state: FIN was consumed by get_frame() but
+                # start_frame() raised QuicPacketBuilderStop, leaving
+                # _pending_eof=False while the FIN was never actually written.
+                sender = quic_stream.sender
+                if (
+                    not sender._pending_eof
+                    and not sender._acked_fin
+                    and sender.buffer_is_empty
+                    and sender._buffer_fin is not None
+                ):
+                    # Re-queue the FIN so the next _transmit() will retry.
+                    logger.debug(
+                        f"close_write stream {self._stream_id}: "
+                        f"re-queuing zombie FIN (attempt {attempt + 1})"
+                    )
+                    sender._pending_eof = True
+                    sender.buffer_is_empty = False
+
+                # Nothing to send yet (pacing / congestion) — wait a bit.
+                await trio.sleep(_RETRY_SLEEP)
+            else:
+                logger.warning(
+                    f"close_write stream {self._stream_id}: "
+                    f"FIN not ACKed after {_MAX_RETRIES} retries"
+                )
 
             self._write_closed = True
 
@@ -360,8 +431,7 @@ class QUICStream(IMuxedStream):
                 else:
                     self._state = StreamState.WRITE_CLOSED
 
-            logger.debug(f"Stream {self.stream_id} write side closed")
-
+            logger.debug(f"close_write SUCCESS on stream {self._stream_id}")
         except Exception as e:
             msg = str(e).lower()
             # These usually happen during shutdown races / late FIN handling.
@@ -531,7 +601,9 @@ class QUICStream(IMuxedStream):
             logger.debug(f"Stream {self.stream_id} received {len(data)} bytes")
 
         if end_stream:
-            self._read_closed = True
+            logger.debug(f"Stream {self._stream_id} received FIN (end_stream=True)")
+            async with self._receive_buffer_lock:
+                self._read_closed = True
             async with self._state_lock:
                 if self._write_closed:
                     self._state = StreamState.CLOSED

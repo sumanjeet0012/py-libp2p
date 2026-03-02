@@ -319,7 +319,16 @@ class NetStream(INetStream):
                     "Cannot close write on stream; stream is in error state"
                 )
 
-        await self.muxed_stream.close()
+        # Prefer close_write() when the underlying muxed stream supports it
+        # (e.g. QUIC), because close() on a QUIC stream also closes the read
+        # side, which would prevent the caller from reading the remote's
+        # response.  For muxers that lack close_write() (yamux, mplex) their
+        # close() semantics already only close the local write side, so
+        # falling back is safe.
+        if hasattr(self.muxed_stream, "close_write"):
+            await self.muxed_stream.close_write()
+        else:
+            await self.muxed_stream.close()
 
         async with self._state_lock:
             if self._state == StreamState.OPEN:

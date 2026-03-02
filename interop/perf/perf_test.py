@@ -304,7 +304,14 @@ class PerfTest:
         return None
 
     def _get_ip_value(self, addr: multiaddr.Multiaddr) -> str | None:
-        return addr.value_for_protocol("ip4") or addr.value_for_protocol("ip6")
+        # value_for_protocol raises ProtocolLookupError when the protocol is
+        # absent, so try each family separately instead of relying on `or`.
+        for proto in ("ip4", "ip6"):
+            try:
+                return addr.value_for_protocol(proto)
+            except Exception:
+                continue
+        return None
 
     def _get_protocol_names(self, addr: multiaddr.Multiaddr) -> list[str]:
         return [p.name for p in addr.protocols()]

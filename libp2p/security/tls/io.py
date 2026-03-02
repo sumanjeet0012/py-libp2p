@@ -263,7 +263,9 @@ class TLSStreamReadWriter(ReadWriteCloser):
     async def read(self, n: int | None = None) -> bytes:
         """Read raw bytes from TLS stream."""
         if self._closed:
-            raise RuntimeError("Cannot read: TLS connection is closed")
+            # Raise EOFError so the muxer layer (mplex/yamux) treats this as a
+            # clean end-of-stream rather than an unexpected RuntimeError.
+            raise EOFError("TLS connection is closed")
         if not self._handshake_complete:
             raise RuntimeError("Call handshake() first")
 

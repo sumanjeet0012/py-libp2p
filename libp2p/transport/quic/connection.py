@@ -127,6 +127,10 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         self._streams: dict[int, QUICStream] = {}
         self._stream_cache: dict[int, QUICStream] = {}  # Cache for frequent lookups
+        # Track inbound stream IDs we've already created so that late events (e.g.
+        # a delayed FIN arriving after the stream wrapper was removed from _streams)
+        # don't trigger a duplicate _create_inbound_stream call.
+        self._seen_inbound_stream_ids: set[int] = set()
         self._next_stream_id: int = self._calculate_initial_stream_id()
         self._stream_handler: TQUICStreamHandlerFn | None = None
 
@@ -1016,6 +1020,16 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
             if not stream:
                 if self._is_incoming_stream(stream_id):
+                    # If we've already seen this inbound stream ID it was completed and
+                    # the wrapper removed from _streams by _cleanup_resources.  Any
+                    # late events (typically a delayed FIN) should be silently dropped
+                    # rather than creating a duplicate stream.
+                    if stream_id in self._seen_inbound_stream_ids:
+                        logger.debug(
+                            "Ignoring late event(s) for completed inbound stream %s",
+                            stream_id,
+                        )
+                        continue
                     try:
                         stream = await self._create_inbound_stream(stream_id)
                     except QUICStreamLimitError:
@@ -1106,6 +1120,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
             self._streams[stream_id] = stream
             self._stream_cache[stream_id] = stream  # Add to cache
+            self._seen_inbound_stream_ids.add(stream_id)
             self._inbound_stream_count += 1
             self._stats["streams_accepted"] += 1
 
@@ -1377,6 +1392,14 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
             if not stream:
                 if self._is_incoming_stream(stream_id):
+                    # If we've already seen this inbound stream ID it was completed
+                    # and the wrapper removed from _streams by _cleanup_resources.
+                    # Late events (typically a delayed FIN) should be silently dropped.
+                    if stream_id in self._seen_inbound_stream_ids:
+                        logger.debug(
+                            f"Ignoring late event for completed inbound stream {stream_id}"
+                        )
+                        return
                     logger.debug(f"Creating new incoming stream {stream_id}")
                     stream = await self._create_inbound_stream(stream_id)
                 else:

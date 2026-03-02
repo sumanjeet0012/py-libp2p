@@ -29,6 +29,12 @@ from .exceptions import (
     MplexStreamReset,
 )
 
+# Noise protocol uses a 2-byte length prefix for encrypted messages (max 65535 bytes).
+# Each encrypted message = plaintext + 16-byte MAC, so plaintext must be <= 65519 bytes.
+# Mplex frame = header_varint (~10 bytes max) + data, so data must be <= 65509 bytes.
+# Use 65507 to match the Yamux cap for consistency.
+MAX_MPLEX_NOISE_CHUNK = 65507
+
 if TYPE_CHECKING:
     from libp2p.stream_muxer.mplex.mplex import (
         Mplex,
@@ -208,7 +214,13 @@ class MplexStream(IMuxedStream):
             if self.event_local_closed.is_set():
                 raise MplexStreamClosed(f"cannot write to closed stream: data={data!r}")
             flag = self._get_header_flag("message")
-            await self.muxed_conn.send_message(flag, data, self.stream_id)
+            # Split into Noise-safe chunks: each mplex frame (header + data) must
+            # fit within the Noise 65535-byte encrypted message limit (minus MAC).
+            offset = 0
+            while offset < len(data):
+                chunk = data[offset : offset + MAX_MPLEX_NOISE_CHUNK]
+                await self.muxed_conn.send_message(flag, chunk, self.stream_id)
+                offset += len(chunk)
 
     async def close(self) -> None:
         """

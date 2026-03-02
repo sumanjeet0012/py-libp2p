@@ -239,14 +239,14 @@ class Mplex(IMuxedConn):
         """
         try:
             header = await decode_uvarint_from_stream(self.secured_conn)
-        except (ParseError, RawConnError, IncompleteReadError) as error:
+        except (ParseError, RawConnError, IncompleteReadError, EOFError) as error:
             raise MplexUnavailable(
                 "failed to read the header correctly from the underlying connection: "
                 f"{error}"
             )
         try:
             message = await read_varint_prefixed_bytes(self.secured_conn)
-        except (ParseError, RawConnError, IncompleteReadError) as error:
+        except (ParseError, RawConnError, IncompleteReadError, EOFError) as error:
             raise MplexUnavailable(
                 "failed to read the message body correctly from the underlying "
                 f"connection: {error}"
