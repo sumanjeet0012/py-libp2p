@@ -580,6 +580,13 @@ class QUICConnection(IRawConnection, IMuxedConn):
                     # Feed packet to QUIC connection
                     self._quic.receive_datagram(data, addr, now=time.time())
 
+                    # Wake the event-processing loop immediately so it can
+                    # call _transmit() for ACKs / MAX_STREAM_DATA frames.
+                    # Without this the loop sleeps for up to 1 s before
+                    # calling datagrams_to_send(), which stalls the server
+                    # on flow-control for large (>window) transfers.
+                    self.notify_packet_arrived()
+
                     # Batch process events
                     await self._process_quic_events_batched()
 

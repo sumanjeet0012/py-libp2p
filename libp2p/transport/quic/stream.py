@@ -590,12 +590,15 @@ class QUICStream(IMuxedStream):
                         f"Stream {self.stream_id} receive buffer overflow, "
                         f"dropping {len(data)} bytes"
                     )
-                    return
+                    # Do NOT return here: if end_stream is True we must still
+                    # process the FIN below, otherwise the read side of this
+                    # stream will never close and the reader will stall until
+                    # READ_TIMEOUT fires.
+                else:
+                    self._receive_buffer.extend(data)
+                    self._timeline.record_first_data()
 
-                self._receive_buffer.extend(data)
-                self._timeline.record_first_data()
-
-            # Notify waiting readers
+            # Notify waiting readers (new data or dropped data that freed space)
             self._receive_event.set()
 
             logger.debug(f"Stream {self.stream_id} received {len(data)} bytes")
