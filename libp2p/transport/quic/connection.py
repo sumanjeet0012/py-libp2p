@@ -491,6 +491,13 @@ class QUICConnection(IRawConnection, IMuxedConn):
             f"and local peer id {str(self.local_peer_id())}"
         )
 
+        # Trio's minimum practical sleep resolution (measured ~0.1–0.2 ms on
+        # mac/linux).  For any timer shorter than this threshold we spin with
+        # await trio.sleep(0) rather than sleeping, avoiding ~100 µs of
+        # scheduling overhead per pacing interval that would otherwise cap
+        # download throughput at ~50 Mbps.
+        _TRIO_SLEEP_MIN = 0.001  # 1 ms threshold
+
         try:
             while not self._closed:
                 # Process all pending events immediately.
@@ -518,6 +525,16 @@ class QUICConnection(IRawConnection, IMuxedConn):
                         timeout = max(0.0, timer - now)
                     else:
                         timeout = 1.0  # maximum idle wait
+
+                    # If the next timer is a sub-millisecond pacing interval,
+                    # do NOT sleep for that tiny duration — trio's actual sleep
+                    # resolution is ~0.1 ms so we would overshoot by 10-100×,
+                    # throttling the send rate far below what the congestion
+                    # window allows.  Instead just yield to other tasks and
+                    # retry immediately.
+                    if timeout < _TRIO_SLEEP_MIN:
+                        await trio.sleep(0)
+                        continue
 
                     packet_event = self._packet_available
                     with trio.move_on_after(timeout):
