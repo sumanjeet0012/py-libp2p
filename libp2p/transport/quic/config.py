@@ -62,7 +62,7 @@ class QUICTransportConfig(ConnectionConfig):
     """Configuration for QUIC transport."""
 
     # Connection settings
-    idle_timeout: float = 30.0  # Seconds before an idle connection is closed.
+    idle_timeout: float = 300.0  # Seconds before an idle connection is closed.
     max_datagram_size: int = (
         1350  # Maximum size of UDP datagrams. 1350 is safe for Docker/loopback.
     )
@@ -116,7 +116,7 @@ class QUICTransportConfig(ConnectionConfig):
     STREAM_ACCEPT_TIMEOUT: float = 30.0
     """Timeout for accepting incoming streams (seconds)."""
 
-    STREAM_READ_TIMEOUT: float = 30.0
+    STREAM_READ_TIMEOUT: float = 120.0
     """Default timeout for stream read operations (seconds)."""
 
     STREAM_WRITE_TIMEOUT: float = 30.0
@@ -156,7 +156,7 @@ class QUICTransportConfig(ConnectionConfig):
     """Connection-wide flow control window size."""
 
     # Buffer management
-    MAX_STREAM_RECEIVE_BUFFER: int = 2 * 1024 * 1024  # 2MB
+    MAX_STREAM_RECEIVE_BUFFER: int = 32 * 1024 * 1024  # 32MB
     """Maximum receive buffer size per stream."""
 
     STREAM_RECEIVE_BUFFER_LOW_WATERMARK: int = 64 * 1024  # 64KB

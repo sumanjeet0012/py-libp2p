@@ -491,12 +491,20 @@ class QUICConnection(IRawConnection, IMuxedConn):
             f"and local peer id {str(self.local_peer_id())}"
         )
 
-        # Trio's minimum practical sleep resolution (measured ~0.1–0.2 ms on
-        # mac/linux).  For any timer shorter than this threshold we spin with
-        # await trio.sleep(0) rather than sleeping, avoiding ~100 µs of
-        # scheduling overhead per pacing interval that would otherwise cap
-        # download throughput at ~50 Mbps.
-        _TRIO_SLEEP_MIN = 0.001  # 1 ms threshold
+        # On Linux (CI), each trio.sleep(0) / task-switch costs roughly one
+        # scheduler quantum (~1 ms).  aioquic's QuicPacketPacer generates
+        # inter-burst intervals as short as ~80 µs (initial CW=14.7 KB,
+        # RTT=1 ms).  Sleeping for that interval with trio would therefore
+        # overshoot by ~12× and cap download throughput at ~30 Mbps regardless
+        # of how large the congestion window grows.  We detect sub-millisecond
+        # timers and busy-wait in pure Python instead (at most 1 ms of CPU per
+        # burst cycle).  _handle_timer_events() and _transmit() have no
+        # internal await points when nothing is pending, so the tight loop
+        # already runs synchronously between bursts.  The await sock.sendto()
+        # calls inside _transmit() still yield the trio scheduler between each
+        # UDP packet send, so the listener's receive loop and the client's
+        # _client_packet_receiver get CPU time while data is actually flowing.
+        _TRIO_SLEEP_MIN = 0.001  # 1 ms threshold; spin below this
 
         try:
             while not self._closed:
@@ -509,33 +517,37 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 # Transmit any pending data
                 await self._transmit()
 
+                # Determine wait time before the next iteration.
+                timer = self._quic.get_timer()
+                now = time.time()
+                timeout = max(0.0, timer - now) if timer is not None else 1.0
+
+                if 0 < timeout < _TRIO_SLEEP_MIN:
+                    # Sub-millisecond timer (almost always the packet pacer).
+                    # Busy-wait in pure Python instead of calling trio.sleep():
+                    # each trio task-switch on Linux costs ~1 ms (a full CFS
+                    # scheduler quantum) and would cap QUIC download throughput
+                    # at ~30 Mbps = 3 pkts × 1350 B / 1 ms.  A tight Python
+                    # while-loop burns ≤ 1 ms of CPU and lets the loop re-enter
+                    # _transmit() as soon as the pacer allows the next burst.
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        pass
+                    # Don't reset _packet_available: any packet that arrived
+                    # during the spin will be picked up on the next iteration
+                    # by _process_quic_events_batched().
+                    continue
+
                 if events_processed:
-                    # We did useful work; yield to other tasks but come back fast.
+                    # We did useful work; yield to other tasks (listener UDP
+                    # loop, client_packet_receiver) before sending the next
+                    # burst.  Only reached when timeout >= 1 ms, so the sleep
+                    # overhead is proportionally small.
                     await trio.sleep(0)
                 else:
                     # Nothing to do right now.  Sleep until the earlier of:
                     #   (a) the next aioquic timer fires, or
                     #   (b) a new UDP packet arrives via notify_packet_arrived().
-                    # This eliminates the fixed 1 ms poll that was the dominant
-                    # source of latency on the server side (where packets feed
-                    # receive_datagram but no separate receiver task exists).
-                    timer = self._quic.get_timer()
-                    now = time.time()
-                    if timer is not None:
-                        timeout = max(0.0, timer - now)
-                    else:
-                        timeout = 1.0  # maximum idle wait
-
-                    # If the next timer is a sub-millisecond pacing interval,
-                    # do NOT sleep for that tiny duration — trio's actual sleep
-                    # resolution is ~0.1 ms so we would overshoot by 10-100×,
-                    # throttling the send rate far below what the congestion
-                    # window allows.  Instead just yield to other tasks and
-                    # retry immediately.
-                    if timeout < _TRIO_SLEEP_MIN:
-                        await trio.sleep(0)
-                        continue
-
                     packet_event = self._packet_available
                     with trio.move_on_after(timeout):
                         await packet_event.wait()
