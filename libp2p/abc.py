@@ -34,6 +34,7 @@ from libp2p.crypto.keys import (
     PublicKey,
 )
 from libp2p.custom_types import (
+    MetadataValue,
     StreamHandlerFn,
     THandler,
     TProtocol,
@@ -62,9 +63,7 @@ if TYPE_CHECKING:
 from libp2p.pubsub.pb import (
     rpc_pb2,
 )
-from libp2p.tools.async_service import (
-    ServiceAPI,
-)
+from libp2p.tools.anyio_service.api import ServiceAPI
 
 # -------------------------- raw_connection interface.py --------------------------
 
@@ -288,13 +287,12 @@ class IMuxedStream(ReadWriteCloser, AsyncContextManager["IMuxedStream"]):
         """
 
     @abstractmethod
-    def set_deadline(self, ttl: int) -> bool:
+    def set_deadline(self, ttl: int) -> None:
         """
         Set a deadline for the stream.
 
         :param ttl: Time-to-live for the stream in seconds.
-        :return: True if the deadline was set successfully,
-            otherwise False.
+        :raises ValueError: if ttl is invalid (e.g. negative).
         """
 
     @abstractmethod
@@ -431,7 +429,7 @@ class IPeerMetadata(ABC):
     """
 
     @abstractmethod
-    def get(self, peer_id: ID, key: str) -> Any:
+    def get(self, peer_id: ID, key: str) -> MetadataValue:
         """
         Retrieve metadata for a specified peer.
 
@@ -442,7 +440,7 @@ class IPeerMetadata(ABC):
         """
 
     @abstractmethod
-    def put(self, peer_id: ID, key: str, val: Any) -> None:
+    def put(self, peer_id: ID, key: str, val: MetadataValue) -> None:
         """
         Store metadata for a specified peer.
 
@@ -897,7 +895,7 @@ class IPeerStore(
 
     # -------METADATA---------
     @abstractmethod
-    def get(self, peer_id: ID, key: str) -> Any:
+    def get(self, peer_id: ID, key: str) -> MetadataValue:
         """
         Retrieve the value associated with a key for a specified peer.
 
@@ -910,7 +908,7 @@ class IPeerStore(
 
         Returns
         -------
-        Any
+        MetadataValue
             The value corresponding to the specified key.
 
         Raises
@@ -921,7 +919,7 @@ class IPeerStore(
         """
 
     @abstractmethod
-    def put(self, peer_id: ID, key: str, val: Any) -> None:
+    def put(self, peer_id: ID, key: str, val: MetadataValue) -> None:
         """
         Store a key-value pair for the specified peer.
 
@@ -931,7 +929,7 @@ class IPeerStore(
             The identifier of the peer.
         key : str
             The key for the data.
-        val : Any
+        val : MetadataValue
             The value to store.
 
         """
@@ -1414,7 +1412,7 @@ class IListener(ABC):
     """
 
     @abstractmethod
-    async def listen(self, maddr: Multiaddr, nursery: trio.Nursery) -> bool:
+    async def listen(self, maddr: Multiaddr, nursery: trio.Nursery) -> None:
         """
         Start listening on the specified multiaddress.
 
@@ -1425,10 +1423,12 @@ class IListener(ABC):
         nursery : trio.Nursery
             The nursery for spawning listening tasks.
 
-        Returns
-        -------
-        bool
-            True if the listener started successfully, otherwise False.
+        Raises
+        ------
+        Exception
+            Transport-specific listener exception, such as
+            ``OpenConnectionError`` (TCP/WebSocket) or ``QUICListenError`` (QUIC),
+            if listening fails (e.g. missing/invalid port or failed start).
 
         """
 
@@ -2075,6 +2075,18 @@ class IHost(ABC):
         """
 
     @abstractmethod
+    def remove_stream_handler(self, protocol_id: TProtocol) -> None:
+        """
+        Remove the stream handler for the specified protocol.
+
+        Parameters
+        ----------
+        protocol_id : TProtocol
+            The protocol identifier to remove the handler for.
+
+        """
+
+    @abstractmethod
     async def initiate_autotls_procedure(self, public_ip: str | None = None) -> None:
         """
         Initiate the ACME-AUTO-TLS-BROKER negotiation for TLS certificate
@@ -2446,7 +2458,7 @@ class IPeerData(ABC):
         """
 
     @abstractmethod
-    def put_metadata(self, key: str, val: Any) -> None:
+    def put_metadata(self, key: str, val: MetadataValue) -> None:
         """
         Store a metadata key-value pair for the peer.
 
@@ -2454,13 +2466,13 @@ class IPeerData(ABC):
         ----------
         key : str
             The metadata key.
-        val : Any
+        val : MetadataValue
             The value to associate with the key.
 
         """
 
     @abstractmethod
-    def get_metadata(self, key: str) -> IPeerMetadata:
+    def get_metadata(self, key: str) -> MetadataValue:
         """
         Retrieve metadata for a given key.
 
@@ -2471,7 +2483,7 @@ class IPeerData(ABC):
 
         Returns
         -------
-        IPeerMetadata
+        MetadataValue
             The metadata value for the given key.
 
         Raises
@@ -2781,6 +2793,18 @@ class IMultiselectMuxer(ABC):
             The protocol name.
         handler : StreamHandlerFn
             The handler function associated with the protocol.
+
+        """
+
+    @abstractmethod
+    def remove_handler(self, protocol: TProtocol) -> None:
+        """
+        Remove the handler for the specified protocol.
+
+        Parameters
+        ----------
+        protocol : TProtocol
+            The protocol name to remove.
 
         """
 
@@ -3284,6 +3308,77 @@ class IPubsub(ServiceAPI):
             The identifier of the topic (str) or topics (list[str]).
         data : bytes
             The data to publish.
+
+        """
+        ...
+
+    @abstractmethod
+    async def wait_for_peer(self, peer_id: ID, timeout: float = 5.0) -> None:
+        """
+        Wait until a pubsub stream with the given peer has been established.
+
+        This method blocks until the given peer has been added to the pubsub
+        peers map, indicating that a pubsub protocol stream exists.
+        Use this instead of arbitrary trio.sleep() calls to avoid race conditions.
+
+        The implementation uses an event-based approach with :class:`trio.Event`
+        so the task consumes zero CPU while waiting.
+
+        Parameters
+        ----------
+        peer_id : ID
+            The identifier of the peer to wait for.
+        timeout : float
+            Maximum time to wait in seconds. Defaults to 5.0.
+
+        Raises
+        ------
+        trio.TooSlowError
+            If the peer stream is not established within the timeout period.
+
+        Example::
+
+            await connect(host1, host2)
+            await pubsub1.wait_for_peer(host2.get_id())
+            # Now safe to publish or check peer_topics
+
+        """
+        ...
+
+    @abstractmethod
+    async def wait_for_subscription(
+        self, peer_id: ID, topic_id: str, timeout: float = 5.0
+    ) -> None:
+        """
+        Wait until a specific peer has subscribed to a topic.
+
+        This method blocks until the given peer appears in the peer_topics map
+        for the specified topic, indicating that they have sent a subscription
+        message. Use this instead of arbitrary trio.sleep() calls to avoid
+        race conditions.
+
+        The implementation uses an event-based approach with :class:`trio.Event`
+        so the task consumes zero CPU while waiting.
+
+        Parameters
+        ----------
+        peer_id : ID
+            The identifier of the peer to wait for.
+        topic_id : str
+            The topic to check subscription for.
+        timeout : float
+            Maximum time to wait in seconds. Defaults to 5.0.
+
+        Raises
+        ------
+        trio.TooSlowError
+            If the peer does not subscribe within the timeout period.
+
+        Example::
+
+            await connect(host1, host2)
+            await pubsub1.wait_for_subscription(host2.get_id(), "my-topic")
+            # Now safe to assert subscription state
 
         """
         ...
