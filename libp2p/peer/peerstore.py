@@ -337,6 +337,14 @@ class PeerStore(IPeerStore):
         record = envelope.record()
         peer_id = record.peer_id
 
+        # Reject records whose signer does not match the record's peer ID.
+        try:
+            signer_peer_id = ID.from_pubkey(envelope.public_key)
+        except Exception:
+            return False
+        if signer_peer_id != peer_id:
+            return False
+
         existing = self.peer_record_map.get(peer_id)
         if existing and existing.seq > record.seq:
             return False  # reject older record
