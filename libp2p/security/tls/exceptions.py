@@ -19,3 +19,15 @@ class MissingLibp2pExtensionError(TLSError):
     """
 
     pass
+
+
+class HandshakeFailure(TLSError):
+    """
+    Raised when the TLS handshake cannot be completed due to an
+    authentication failure, such as a missing or invalid peer certificate.
+
+    This is a hard failure: the connection must be closed immediately and
+    must not be surfaced as an authenticated SecureSession.
+    """
+
+    pass
