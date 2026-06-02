@@ -688,14 +688,27 @@ class CircuitV2Protocol(Service):
                 await stream.reset()
                 return
 
-        # Check resource limits
-        if not self.resource_manager.can_accept_connection(peer_id=source_addr):
+        if not self.resource_manager.can_accept_connection(peer_id=peer_id):
+            relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
+            relay_envelope = unmarshal_envelope(relay_envelope_bytes)
+            await self._send_status(
+                stream,
+                StatusCode.NO_RESERVATION,
+                "Destination peer has no active reservation on this relay",
+                relay_envelope,
+            )
+            await stream.reset()
+            return
+
+        # Separately enforce the source peer's per-reservation connection limit.
+        source_reservation = self.resource_manager._reservations.get(source_addr)
+        if source_reservation and not source_reservation.can_accept_connection():
             relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             relay_envelope = unmarshal_envelope(relay_envelope_bytes)
             await self._send_status(
                 stream,
                 StatusCode.RESOURCE_LIMIT_EXCEEDED,
-                "Connection limit exceeded",
+                "Source peer has exceeded its connection limit",
                 relay_envelope,
             )
             await stream.reset()
