@@ -1218,3 +1218,74 @@ async def test_reservation_fails_with_invalid_record_transfer():
                 logger.info("Invalid SPR was correctly rejected")
 
         logger.info("Invalid SPR correctly rejected, peerstore protected")
+
+
+@pytest.mark.trio
+async def test_circuit_v2_connect_fails_without_reservation():
+    """Test that relay rejects CONNECT requests for unreserved destinations."""
+    async with HostFactory.create_batch_and_listen(3) as hosts:
+        relay_host, source_host, dest_host = hosts
+        logger.info(
+            "Created hosts for test_circuit_v2_connect_fails_without_reservation"
+        )
+
+        # Setup relay
+        limits = RelayLimits(
+            duration=DEFAULT_RELAY_LIMITS.duration,
+            data=DEFAULT_RELAY_LIMITS.data,
+            max_circuit_conns=DEFAULT_RELAY_LIMITS.max_circuit_conns,
+            max_reservations=DEFAULT_RELAY_LIMITS.max_reservations,
+        )
+        relay_protocol = CircuitV2Protocol(relay_host, limits, allow_hop=True)
+
+        async with background_trio_service(relay_protocol):
+            await relay_protocol.event_started.wait()
+
+            # Connect source to relay
+            await connect(source_host, relay_host)
+            await trio.sleep(SLEEP_TIME)
+
+            # Source sends CONNECT request for dest (who has NO reservation)
+            stream = None
+            try:
+                with trio.fail_after(STREAM_TIMEOUT):
+                    stream = await source_host.new_stream(
+                        relay_host.get_id(), [PROTOCOL_ID]
+                    )
+
+                    connect_msg = proto.HopMessage(
+                        type=proto.HopMessage.CONNECT,
+                        peer=dest_host.get_id().to_bytes(),
+                    )
+
+                    await stream.write(connect_msg.SerializeToString())
+                    logger.info(
+                        "Sent CONNECT request for destination without reservation"
+                    )
+
+                    # Read response
+                    response_bytes = await stream.read(MAX_READ_LEN)
+                    assert response_bytes, "No response received"
+
+                    response = proto.HopMessage()
+                    response.ParseFromString(response_bytes)
+
+                    # Verify response status is NO_RESERVATION (204)
+                    assert response.type == proto.HopMessage.STATUS
+                    assert response.status.code == proto.Status.NO_RESERVATION, (
+                        "Expected status NO_RESERVATION(204), "
+                        f"got {response.status.code}"
+                    )
+
+                    # Verify stream is reset (or EOF)
+                    try:
+                        next_data = await stream.read(MAX_READ_LEN)
+                        assert not next_data, (
+                            "Stream should be closed/reset after error status"
+                        )
+                    except (StreamEOF, StreamReset, StreamError):
+                        pass
+
+            finally:
+                if stream:
+                    await close_stream(stream)

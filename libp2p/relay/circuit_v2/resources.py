@@ -552,3 +552,23 @@ class RelayResourceManager:
             return self.limits.duration
 
         return 0
+
+    def get_reservation(self, peer_id: ID) -> Reservation | None:
+        """
+        Get an active reservation for a peer.
+
+        Parameters
+        ----------
+        peer_id : ID
+            The peer ID to get the reservation for
+
+        Returns
+        -------
+        Reservation | None
+            The reservation if it exists and is active, None otherwise
+
+        """
+        reservation = self._reservations.get(peer_id)
+        if reservation and not reservation.is_expired():
+            return reservation
+        return None

@@ -585,7 +585,7 @@ class CircuitV2Protocol(Service):
                 status_msg_text = "Reservation accepted"
 
             # Get the reservation object to access its voucher and sign it
-            reservation_obj = self.resource_manager._reservations.get(peer_id)
+            reservation_obj = self.resource_manager.get_reservation(peer_id)
             if not reservation_obj:
                 raise ValueError(f"Failed to create reservation for peer {peer_id}")
 
@@ -701,7 +701,7 @@ class CircuitV2Protocol(Service):
             return
 
         # Separately enforce the source peer's per-reservation connection limit.
-        source_reservation = self.resource_manager._reservations.get(source_addr)
+        source_reservation = self.resource_manager.get_reservation(source_addr)
         if source_reservation and not source_reservation.can_accept_connection():
             relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             relay_envelope = unmarshal_envelope(relay_envelope_bytes)
@@ -785,7 +785,7 @@ class CircuitV2Protocol(Service):
             logger.debug("Connection established for peer %s", peer_id)
 
             # Update reservation connection count
-            reservation = self.resource_manager._reservations.get(peer_id)
+            reservation = self.resource_manager.get_reservation(peer_id)
             if reservation:
                 reservation.active_connections += 1
                 logger.debug(
@@ -861,7 +861,7 @@ class CircuitV2Protocol(Service):
         """
         try:
             # Get the reservation for tracking data usage
-            reservation = self.resource_manager._reservations.get(peer_id)
+            reservation = self.resource_manager.get_reservation(peer_id)
             total_bytes = 0
 
             while True:
@@ -909,7 +909,7 @@ class CircuitV2Protocol(Service):
                     break
 
                 # Update resource usage
-                reservation = self.resource_manager._reservations.get(peer_id)
+                reservation = self.resource_manager.get_reservation(peer_id)
                 if reservation:
                     reservation.data_used += len(data)
                     if reservation.data_used >= reservation.limits.data:
