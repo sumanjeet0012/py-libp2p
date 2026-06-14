@@ -19,6 +19,9 @@ _PERF_TEST_PATH = _REPO_ROOT / "interop" / "perf" / "perf_test.py"
 
 
 def _load_perf_test_module():
+    from unittest.mock import MagicMock
+
+    sys.modules["redis"] = MagicMock()
     spec = importlib.util.spec_from_file_location("interop_perf_test", _PERF_TEST_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
