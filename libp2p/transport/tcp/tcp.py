@@ -226,6 +226,11 @@ class TCP(ITransport):
         :raise OpenConnectionError: raised when failed to open connection
         """
         protocols = list(maddr.protocols())
+        
+        # Do not attempt to handle circuit relay multiaddrs with raw TCP transport
+        if any(p.name == "p2p-circuit" for p in protocols):
+            raise OpenConnectionError(f"TCPTransport cannot dial circuit relay multiaddr: {maddr}")
+            
         dns_protocols = {"dns", "dns4", "dns6", "dnsaddr"}
         if protocols and protocols[0].name in dns_protocols:
             resolved = await resolve_multiaddr_with_retry(

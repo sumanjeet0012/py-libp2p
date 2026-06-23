@@ -551,6 +551,13 @@ class CircuitV2Protocol(Service):
         try:
             peer_id = ID(msg.peer)
             logger.debug("Handling reservation request from peer %s", peer_id)
+            
+            remote_peer_id = stream.muxed_conn.peer_id
+            if peer_id != remote_peer_id:
+                swarm = self.host.get_network()
+                if remote_peer_id in swarm.connections:
+                    swarm.connections[peer_id] = swarm.connections[remote_peer_id]
+
             signed_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             signed_envelope = unmarshal_envelope(signed_envelope_bytes)
 
@@ -689,7 +696,7 @@ class CircuitV2Protocol(Service):
                 return
 
         # Check resource limits
-        if not self.resource_manager.can_accept_connection(peer_id=source_addr):
+        if not self.resource_manager.can_accept_connection(peer_id=peer_id):
             relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             relay_envelope = unmarshal_envelope(relay_envelope_bytes)
             await self._send_status(

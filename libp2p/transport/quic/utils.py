@@ -69,6 +69,10 @@ def is_quic_multiaddr(maddr: multiaddr.Multiaddr) -> bool:
     """
     try:
         addr_str = str(maddr)
+        
+        # Do not attempt to handle circuit relay multiaddrs with raw QUIC transport
+        if "p2p-circuit" in addr_str:
+            return False
 
         # Check for required components
         has_ip = f"/{IP4_PROTOCOL}/" in addr_str or f"/{IP6_PROTOCOL}/" in addr_str
