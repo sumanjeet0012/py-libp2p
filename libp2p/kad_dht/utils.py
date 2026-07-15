@@ -118,9 +118,15 @@ def xor_distance(key1: bytes, key2: bytes) -> int:
         int: The XOR distance between the keys
 
     """
+    import hashlib
     # Ensure the inputs are bytes
     if not isinstance(key1, bytes) or not isinstance(key2, bytes):
         raise TypeError("Both key1 and key2 must be bytes objects")
+
+    if len(key1) != 32:
+        key1 = hashlib.sha256(key1).digest()
+    if len(key2) != 32:
+        key2 = hashlib.sha256(key2).digest()
 
     # Convert to integers
     k1 = int.from_bytes(key1, byteorder="big")
