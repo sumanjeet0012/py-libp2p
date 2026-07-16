@@ -27,6 +27,7 @@ from libp2p.peer.peerstore import env_to_send_in_RPC
 from .common import (
     ALPHA,
     PROTOCOL_ID,
+    QUERY_TIMEOUT,
 )
 from .pb.kademlia_pb2 import (
     Message,
@@ -290,63 +291,68 @@ class PeerRouting(IPeerRouting):
 
             # Open a stream to the peer using the Kademlia protocol
             logger.debug(f"Opening stream to {peer} for closest peers query")
-            try:
-                stream = await self.host.new_stream(peer, [PROTOCOL_ID])
-                logger.debug(f"Stream opened to {peer}")
-            except Exception as e:
-                logger.warning(f"Failed to open stream to {peer}: {e}")
+            with trio.move_on_after(QUERY_TIMEOUT) as cancel_scope:
+                try:
+                    stream = await self.host.new_stream(peer, [PROTOCOL_ID])
+                    logger.debug(f"Stream opened to {peer}")
+                except Exception as e:
+                    logger.warning(f"Failed to open stream to {peer}: {e}")
+                    return []
+
+                # Create and send FIND_NODE request using protobuf
+                find_node_msg = Message()
+                find_node_msg.type = Message.MessageType.FIND_NODE
+                find_node_msg.key = target_key  # Set target key directly as bytes
+
+                # Create sender_signed_peer_record
+                envelope_bytes, _ = env_to_send_in_RPC(self.host)
+                find_node_msg.senderRecord = envelope_bytes
+
+                # Serialize and send the protobuf message with varint length prefix
+                proto_bytes = find_node_msg.SerializeToString()
+                logger.debug(
+                    f"Sending FIND_NODE: {proto_bytes.hex()} (len={len(proto_bytes)})"
+                )
+                await stream.write(varint.encode(len(proto_bytes)))
+                await stream.write(proto_bytes)
+
+                # Read varint-prefixed response length
+                length_bytes = b""
+                while True:
+                    b = await stream.read(1)
+                    if not b:
+                        logger.warning(
+                            "Error reading varint length from stream: connection closed"
+                        )
+                        return []
+                    length_bytes += b
+                    if b[0] & 0x80 == 0:
+                        break
+                response_length = varint.decode_bytes(length_bytes)
+
+                # Read response data
+                response_bytes = b""
+                remaining = response_length
+                while remaining > 0:
+                    chunk = await stream.read(remaining)
+                    if not chunk:
+                        logger.debug(f"Connection closed by peer {peer} while reading data")
+                        return []
+                    response_bytes += chunk
+                    remaining -= len(chunk)
+
+                # Parse the protobuf response
+                response_msg = Message()
+                response_msg.ParseFromString(response_bytes)
+                logger.debug(
+                    "Received response from %s with %d peers",
+                    peer,
+                    len(response_msg.closerPeers),
+                )
+            if cancel_scope.cancelled_caught:
+                logger.warning(f"Timeout querying peer {peer} for closest peers")
                 return []
 
-            # Create and send FIND_NODE request using protobuf
-            find_node_msg = Message()
-            find_node_msg.type = Message.MessageType.FIND_NODE
-            find_node_msg.key = target_key  # Set target key directly as bytes
-
-            # Create sender_signed_peer_record
-            envelope_bytes, _ = env_to_send_in_RPC(self.host)
-            find_node_msg.senderRecord = envelope_bytes
-
-            # Serialize and send the protobuf message with varint length prefix
-            proto_bytes = find_node_msg.SerializeToString()
-            logger.debug(
-                f"Sending FIND_NODE: {proto_bytes.hex()} (len={len(proto_bytes)})"
-            )
-            await stream.write(varint.encode(len(proto_bytes)))
-            await stream.write(proto_bytes)
-
-            # Read varint-prefixed response length
-            length_bytes = b""
-            while True:
-                b = await stream.read(1)
-                if not b:
-                    logger.warning(
-                        "Error reading varint length from stream: connection closed"
-                    )
-                    return []
-                length_bytes += b
-                if b[0] & 0x80 == 0:
-                    break
-            response_length = varint.decode_bytes(length_bytes)
-
-            # Read response data
-            response_bytes = b""
-            remaining = response_length
-            while remaining > 0:
-                chunk = await stream.read(remaining)
-                if not chunk:
-                    logger.debug(f"Connection closed by peer {peer} while reading data")
-                    return []
-                response_bytes += chunk
-                remaining -= len(chunk)
-
-            # Parse the protobuf response
-            response_msg = Message()
-            response_msg.ParseFromString(response_bytes)
-            logger.debug(
-                "Received response from %s with %d peers",
-                peer,
-                len(response_msg.closerPeers),
-            )
 
             # Process closest peers from response
             if response_msg.type == Message.MessageType.FIND_NODE:
