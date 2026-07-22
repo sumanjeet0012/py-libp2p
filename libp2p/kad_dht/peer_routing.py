@@ -397,7 +397,7 @@ class PeerRouting(IPeerRouting):
                             )
                         except Exception as e:
                             logger.debug(
-                                f"Failed to add discovered peer {new_peer_id} to routing table: {e}"
+                                f"Failed to add discovered peer {new_peer_id} to routing table: {e}"  # noqa: E501
                             )
 
         except Exception as e:
