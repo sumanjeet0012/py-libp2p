@@ -405,6 +405,7 @@ class ProviderStore:
         logger.debug(
             f"Searching {len(closest_peers)} peers for providers of {key.hex()}"
         )
+        find_start = time.monotonic()
 
         # Iterative provider lookup
         all_providers: list[PeerInfo] = []
@@ -485,7 +486,10 @@ class ProviderStore:
         event.find_providers = True
         event.key = key.hex()
         event.providers_found = len(all_providers[:count])
+        event.peers_queried = len(queried_peers)
+        event.peers_responded = [str(p.peer_id) for p in all_providers[:count]][:10]
         event.success = len(all_providers) > 0
+        event.duration_ms = (time.monotonic() - find_start) * 1000
         self.host.get_event_bus().emit(event)
         return all_providers[:count]
 

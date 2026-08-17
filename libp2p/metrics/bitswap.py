@@ -67,7 +67,7 @@ class BitswapMetrics:
         )
         self.provider_queries = Counter(
             "bitswap_provider_queries_total",
-            "Total Bitswap DHT provider queries",
+            "Total Bitswap DHT provider queries (one per CID)",
             labelnames=["result"],
         )
         self.provider_queries_found = Histogram(

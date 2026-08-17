@@ -1,4 +1,5 @@
-"""Event definitions for the peer discovery modules.
+"""
+Event definitions for the peer discovery modules.
 
 Emitted on the host's event bus whenever a discovery module observes
 something: a peer is discovered or lost via mDNS/bootstrap/random-walk,
@@ -11,7 +12,8 @@ occurrences.
 
 
 class DiscoveryEvent:
-    """A discovery event, emitted on the host's event bus.
+    """
+    A discovery event, emitted on the host's event bus.
 
     One event object carries a single occurrence; boolean flags mark which
     kind of event it is and the remaining fields carry its payload.
@@ -31,3 +33,8 @@ class DiscoveryEvent:
     duration_ms: float | None = None
     peers_found: int | None = None
     reason: str | None = None
+
+    # Debugging details (random walk / refresh)
+    target_key: str | None = None  # the random key / peer id generated for the walk
+    peers: list[str] | None = None  # peer ids returned by the query (bounded)
+    peers_added: int | None = None  # peers added to the routing table (refresh)

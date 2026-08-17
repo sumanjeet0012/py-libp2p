@@ -321,15 +321,6 @@ class ProviderQueryManager:
             f"Provider discovery complete: {len(results)}/{len(cids)} CIDs resolved"
         )
 
-        # Emit provider-query metric event (one per batch, providers found)
-        total_found = sum(len(providers) for providers in results.values())
-        event = BitswapEvent()
-        event.provider_query = True
-        event.cid = str(len(cids))
-        event.peers_found = total_found
-        event.success = len(results) > 0
-        self.dht.host.get_event_bus().emit(event)
-
         return results
 
     async def _query_single(
@@ -354,6 +345,7 @@ class ProviderQueryManager:
         """
         async with self.query_semaphore:
             self._stats["queries"] += 1
+            query_start = time.monotonic()
 
             try:
                 with trio.fail_after(timeout):
@@ -388,6 +380,17 @@ class ProviderQueryManager:
                             f"No providers found for "
                             f"{format_cid_for_display(cid, max_len=12)}"
                         )
+
+                    # Emit one provider-query event per CID with the exact
+                    # providers found (bounded to keep payloads small).
+                    event = BitswapEvent()
+                    event.provider_query = True
+                    event.cid = format_cid_for_display(cid)
+                    event.peers_found = len(providers)
+                    event.success = len(providers) > 0
+                    event.duration_ms = (time.monotonic() - query_start) * 1000
+                    event.providers = [str(p) for p in providers][:10]
+                    self.dht.host.get_event_bus().emit(event)
 
             except trio.TooSlowError:
                 self._stats["errors"] += 1

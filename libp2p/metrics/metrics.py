@@ -1,6 +1,6 @@
 import logging
 import socket
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prometheus_client import start_http_server
 import trio
@@ -11,10 +11,23 @@ from libp2p.kad_dht.events import KadDhtEvent
 from libp2p.metrics.bitswap import BitswapMetrics
 from libp2p.metrics.discovery import DiscoveryMetrics
 from libp2p.metrics.gossipsub import GossipsubMetrics
+from libp2p.metrics.identity import IdentityMetrics
 from libp2p.metrics.kad_dht import KadDhtMetrics
+from libp2p.metrics.muxer import MuxerMetrics
 from libp2p.metrics.ping import PingMetrics
+from libp2p.metrics.relay import RelayMetrics
+from libp2p.metrics.request_response import RequestResponseMetrics
+from libp2p.metrics.security import SecurityMetrics
 from libp2p.metrics.swarm import SwarmEvent, SwarmMetrics
+from libp2p.metrics.transport import (
+    ListenConn,
+    ListenConnMetrics,
+    TransportMetrics,
+)
 from libp2p.pubsub.pubsub import GossipsubEvent
+
+if TYPE_CHECKING:
+    from libp2p.metrics.rcmgr import RcMgrMetrics
 
 logger = logging.getLogger("libp2p.metrics")
 
@@ -34,20 +47,81 @@ def find_available_port(start_port: int = 8000, host: str = "127.0.0.1") -> int:
 
 
 class Metrics:
+    """
+    Prometheus collectors for all libp2p modules.
+
+    ``Metrics()`` is a process-wide singleton: constructing it again returns
+    the already-initialized instance. This keeps multi-host processes (e.g.
+    tests or embedded peers) from re-registering the same family names on the
+    default registry, which would raise ``ValueError: Duplicated timeseries``.
+    """
+
+    _instance: "Metrics | None" = None
+
     ping: PingMetrics
     gossipsub: GossipsubMetrics
     kad_dht: KadDhtMetrics
     swarm: SwarmMetrics
     bitswap: BitswapMetrics
     discovery: DiscoveryMetrics
+    identity: IdentityMetrics
+    relay: RelayMetrics
+    transport: TransportMetrics
+    muxer: MuxerMetrics
+    security: SecurityMetrics
+    request_response: RequestResponseMetrics
+    listen_conns: ListenConnMetrics
 
-    def __init__(self) -> None:
+    rcmgr: "RcMgrMetrics | None"
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "Metrics":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, resource_manager: Any = None) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
         self.ping = PingMetrics()
         self.gossipsub = GossipsubMetrics()
         self.kad_dht = KadDhtMetrics()
         self.swarm = SwarmMetrics()
         self.bitswap = BitswapMetrics()
         self.discovery = DiscoveryMetrics()
+        self.identity = IdentityMetrics()
+        self.relay = RelayMetrics()
+        self.transport = TransportMetrics()
+        self.muxer = MuxerMetrics()
+        self.security = SecurityMetrics()
+        self.request_response = RequestResponseMetrics()
+        self.listen_conns = ListenConnMetrics()
+        self.rcmgr = None
+
+        if resource_manager is not None:
+            self.attach_rcmgr(resource_manager)
+
+    def attach_rcmgr(self, resource_manager: Any) -> "Metrics":
+        """
+        Expose the resource manager's counters on the shared Prometheus
+        registry (go-libp2p-style ``libp2p_rcmgr_*`` gauges). No-op if the
+        resource manager exposes no ``metrics`` summary.
+        """
+        from prometheus_client.registry import REGISTRY
+
+        from libp2p.metrics.rcmgr import RcMgrMetrics
+
+        bridge = RcMgrMetrics(resource_manager)
+        try:
+            REGISTRY.unregister(bridge)
+        except Exception:
+            pass
+        try:
+            REGISTRY.register(bridge)
+        except Exception:
+            pass
+        self.rcmgr = bridge
+        return self
 
     def attach(self, event_bus: EventBus) -> "Metrics":
         """
@@ -113,5 +187,7 @@ class Metrics:
                         self.kad_dht.record(event)
                     case SwarmEvent():
                         self.swarm.record(event)
+                    case ListenConn():
+                        self.listen_conns.record(event)
             except Exception:
                 logger.debug("Failed to record metric event: %r", event, exc_info=True)

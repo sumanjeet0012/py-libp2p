@@ -74,11 +74,14 @@ class RandomWalk:
 
         """
         try:
+            random_id: str | None = None
             if target_key is None:
                 random_peer_id = self.generate_random_peer_id()
                 target_key = bytes.fromhex(random_peer_id)
+                random_id = random_peer_id
                 key_desc = f"{random_peer_id[:8]}..."
             else:
+                random_id = target_key.hex()
                 key_desc = f"{target_key.hex()[:8]}..."
 
             logger.info(f"Starting random walk for target key: {key_desc}")
@@ -91,7 +94,9 @@ class RandomWalk:
 
             if not discovered_peer_ids:
                 logger.debug(f"No peers discovered in random walk for {key_desc}")
-                self._emit_walk_event(peers_found=0, success=False)
+                self._emit_walk_event(
+                    random_id=random_id, peers_found=0, peers=[], success=False
+                )
                 return []
 
             logger.info(
@@ -113,21 +118,39 @@ class RandomWalk:
                     logger.debug(f"Failed to create PeerInfo for {peer_id}: {e}")
                     continue
 
-            self._emit_walk_event(peers_found=len(validated_peers), success=True)
+            self._emit_walk_event(
+                random_id=random_id,
+                peers_found=len(discovered_peer_ids),
+                peers=[str(pid) for pid in discovered_peer_ids],
+                success=True,
+            )
             return validated_peers
 
         except Exception as e:
             logger.error(f"Random walk failed: {e}")
-            self._emit_walk_event(peers_found=0, success=False)
+            self._emit_walk_event(
+                random_id=random_id, peers_found=0, peers=[], success=False
+            )
             raise RandomWalkError(f"Random walk operation failed: {e}") from e
 
-    def _emit_walk_event(self, *, peers_found: int, success: bool) -> None:
+    def _emit_walk_event(
+        self,
+        *,
+        random_id: str | None,
+        peers_found: int,
+        peers: list[str],
+        success: bool,
+    ) -> None:
         """Emit a random-walk discovery event on the host's event bus."""
         event = DiscoveryEvent()
         event.random_walk = True
         event.source = "random_walk"
         event.peers_found = peers_found
         event.success = success
+        event.target_key = random_id
+        # Bound the peer list to keep the event bus payload small; the count
+        # always carries the full total.
+        event.peers = peers[:10]
         self.host.get_event_bus().emit(event)
 
     async def run_concurrent_random_walks(

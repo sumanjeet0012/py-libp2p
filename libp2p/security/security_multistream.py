@@ -51,8 +51,11 @@ class SecurityMultistream(ABC):
 
     _selector: "GenericMultistreamSelector[ISecureTransport]"
 
+    last_selected_protocol: TProtocol | None
+
     def __init__(self, secure_transports_by_protocol: TSecurityOptions) -> None:
         self._selector = GenericMultistreamSelector()
+        self.last_selected_protocol = None
 
         for protocol, transport in secure_transports_by_protocol.items():
             self.add_transport(protocol, transport)
@@ -118,8 +121,10 @@ class SecurityMultistream(ABC):
         :return: selected secure transport
         """
         try:
-            _, transport = await self._selector.select(conn, is_initiator)
+            protocol, transport = await self._selector.select(conn, is_initiator)
+            self.last_selected_protocol = protocol
         except (MultiselectError, MultiselectClientError) as error:
+            self.last_selected_protocol = None
             raise MultiselectError(
                 "Failed to negotiate a security protocol: no protocol selected"
             ) from error

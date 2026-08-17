@@ -372,6 +372,8 @@ class BitswapClient(INotifee):
         event = BitswapEvent()
         event.want_add = True
         event.cid = format_cid_for_display(cid_obj)
+        event.priority = priority
+        event.want_type = "have" if want_type else "block"
         self.host.get_event_bus().emit(event)
 
     async def have_block(self, cid: CIDInput, peer_id: PeerID | None = None) -> bool:
@@ -562,6 +564,12 @@ class BitswapClient(INotifee):
                 if want_type == 1:  # Have request (v1.2.0)
                     msg_queue.add_presences([(cid, True)])
                 else:  # Block request
+                    block_event = BitswapEvent()
+                    block_event.block_sent = True
+                    block_event.cid = format_cid_for_display(cid)
+                    block_event.peer_id = str(peer_id)
+                    block_event.size_bytes = len(data)
+                    self.host.get_event_bus().emit(block_event)
                     peer_protocol = (
                         msg_queue.negotiated_protocol
                         or self._peer_protocols.get(peer_id, BITSWAP_PROTOCOL_V100)
@@ -830,6 +838,12 @@ class BitswapClient(INotifee):
                     if has_block:
                         data = await self.block_store.get_block(entry_cid)
                         if data:
+                            block_event = BitswapEvent()
+                            block_event.block_sent = True
+                            block_event.cid = format_cid_for_display(entry_cid)
+                            block_event.peer_id = str(peer_id)
+                            block_event.size_bytes = len(data)
+                            self.host.get_event_bus().emit(block_event)
                             if peer_protocol == BITSWAP_PROTOCOL_V100:
                                 blocks_to_send_v100.append(data)
                             else:

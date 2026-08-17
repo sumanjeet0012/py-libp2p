@@ -1,4 +1,5 @@
-"""INotifee-style event bus for libp2p.
+"""
+INotifee-style event bus for libp2p.
 
 Modules emit typed event objects whenever something happens — a Kad-DHT
 lookup completes, a Bitswap block arrives, mDNS discovers a peer, a pubsub
@@ -34,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 class IEventListener(ABC):
-    """A listener that wants to be notified of module events.
+    """
+    A listener that wants to be notified of module events.
 
     Analogous to ``INotifee`` in the network layer: an object registered
     with the :class:`EventBus` that receives every emitted event. Unlike
@@ -44,7 +46,8 @@ class IEventListener(ABC):
 
     @abstractmethod
     def handle_event(self, event: Any) -> None:
-        """Handle a single emitted event.
+        """
+        Handle a single emitted event.
 
         Implementations MUST be fast and non-blocking. Any exception raised
         here is caught by the bus and logged — it never propagates to the
@@ -53,7 +56,8 @@ class IEventListener(ABC):
 
 
 class EventBus:
-    """Fan-out event bus with INotifee-style listener registration.
+    """
+    Fan-out event bus with INotifee-style listener registration.
 
     Emitters call :meth:`emit` with a typed event object; every registered
     listener's :meth:`IEventListener.handle_event` is invoked, with
@@ -65,7 +69,8 @@ class EventBus:
         self._lock = threading.Lock()
 
     def register_listener(self, listener: IEventListener) -> None:
-        """Subscribe ``listener`` to all events emitted on this bus.
+        """
+        Subscribe ``listener`` to all events emitted on this bus.
 
         Registering the same listener twice is a no-op.
         """
@@ -86,7 +91,8 @@ class EventBus:
             return list(self._listeners)
 
     def emit(self, event: Any) -> None:
-        """Fan out ``event`` to every registered listener.
+        """
+        Fan out ``event`` to every registered listener.
 
         Each listener runs inline, wrapped in try/except so a raising
         listener never propagates into the emitter or blocks other
@@ -104,7 +110,8 @@ class EventBus:
 
 
 class ChannelBridgeListener(IEventListener):
-    """Bridge that forwards bus events into a trio memory send channel.
+    """
+    Bridge that forwards bus events into a trio memory send channel.
 
     Backward-compatibility shim: the pre-event-bus metrics pipeline flowed
     events from a ``trio.open_memory_channel`` send end attached to every

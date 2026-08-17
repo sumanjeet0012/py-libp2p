@@ -153,7 +153,11 @@ class PeerRouting(IPeerRouting):
         return None
 
     async def _query_single_peer_for_closest(
-        self, peer: ID, target_key: bytes, new_peers: list[ID]
+        self,
+        peer: ID,
+        target_key: bytes,
+        new_peers: list[ID],
+        responding_peers: list[ID],
     ) -> None:
         """
         Query a single peer for closest peers and append results to the shared list.
@@ -164,19 +168,25 @@ class PeerRouting(IPeerRouting):
             The target key to find closest peers for
         params: new_peers : list[ID]
             Shared list to append results to
+        params: responding_peers : list[ID]
+            Shared list of peers that returned at least one closer peer
 
         """
         try:
             result = await self._query_peer_for_closest(peer, target_key)
             # Add deduplication to prevent duplicate peers
+            added = 0
             for peer_id in result:
                 if peer_id not in new_peers:
                     new_peers.append(peer_id)
+                    added += 1
+            if added > 0:
+                responding_peers.append(peer)
             logger.debug(
                 "Queried peer %s for closest peers, got %d results (%d unique)",
                 peer,
                 len(result),
-                len([p for p in result if p not in new_peers[: -len(result)]]),
+                added,
             )
         except Exception as e:
             logger.debug(f"Query to peer {peer} failed: {e}")
@@ -255,6 +265,7 @@ class PeerRouting(IPeerRouting):
                 peers_found=0,
                 start_time=start_time,
                 success=False,
+                peers_responded=[],
             )
             return []
 
@@ -268,12 +279,15 @@ class PeerRouting(IPeerRouting):
         # round we re-sort and may discover closer peers for the next round.
         sem = trio.Semaphore(ALPHA)
         new_peers: list[ID] = []
+        responding_peers: list[ID] = []
         query_count = 0
 
         async def _guarded_query(peer: ID) -> None:
             """Run a single peer query while holding one semaphore slot."""
             try:
-                await self._query_single_peer_for_closest(peer, target_key, new_peers)
+                await self._query_single_peer_for_closest(
+                    peer, target_key, new_peers, responding_peers
+                )
             finally:
                 sem.release()
 
@@ -369,6 +383,7 @@ class PeerRouting(IPeerRouting):
             peers_found=len(closest_peers),
             start_time=start_time,
             success=len(closest_peers) > 0,
+            peers_responded=[str(p) for p in responding_peers][:10],
         )
         return closest_peers
 
@@ -380,6 +395,7 @@ class PeerRouting(IPeerRouting):
         peers_found: int,
         start_time: float,
         success: bool,
+        peers_responded: list[str] | None = None,
     ) -> None:
         """Emit a Kad-DHT lookup event on the host's event bus."""
         event = KadDhtEvent()
@@ -388,6 +404,7 @@ class PeerRouting(IPeerRouting):
         event.duration_ms = (trio.current_time() - start_time) * 1000
         event.peers_queried = query_count
         event.peers_found = peers_found
+        event.peers_responded = peers_responded
         event.success = success
         self.host.get_event_bus().emit(event)
 

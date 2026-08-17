@@ -1,4 +1,5 @@
-"""Event definitions for the Bitswap module.
+"""
+Event definitions for the Bitswap module.
 
 Emitted on the host's event bus whenever something observable happens in
 Bitswap: wantlist changes, block transfer, message flow, sessions and
@@ -7,7 +8,8 @@ provider queries.
 
 
 class BitswapEvent:
-    """A Bitswap event, emitted on the host's event bus.
+    """
+    A Bitswap event, emitted on the host's event bus.
 
     One event object carries a single occurrence; boolean flags mark which
     kind of event it is and the remaining fields carry its payload.
@@ -33,3 +35,6 @@ class BitswapEvent:
     success: bool | None = None
     peers_found: int | None = None
     duration_ms: float | None = None
+    priority: int | None = None
+    want_type: str | None = None  # "block" or "have"
+    providers: list[str] | None = None  # provider peer ids found (bounded)

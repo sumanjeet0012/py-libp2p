@@ -77,6 +77,7 @@ from libp2p.identity.identify_push.identify_push import (
 from libp2p.identity.update import (
     update_peerstore_from_identify,
 )
+from libp2p.metrics.identity import IdentityEvent
 from libp2p.peer.id import (
     ID,
 )
@@ -1163,6 +1164,12 @@ class BasicHost(IHost):
             stream = await self.new_stream(peer_id, [IdentifyID])
         except Exception as exc:
             logger.debug("Identify[%s]: failed to open stream: %s", reason, exc)
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "outbound"
+            event.peer_id = str(peer_id)
+            event.success = False
+            self.get_event_bus().emit(event)
             return
 
         try:
@@ -1176,6 +1183,12 @@ class BasicHost(IHost):
                     data = await stream.read()
             if _id_cs.cancelled_caught:
                 logger.debug("Identify[%s]: read timed out for %s", reason, peer_id)
+                event = IdentityEvent()
+                event.identify = True
+                event.direction = "outbound"
+                event.peer_id = str(peer_id)
+                event.success = False
+                self.get_event_bus().emit(event)
                 try:
                     await stream.reset()
                 except Exception:
@@ -1241,8 +1254,20 @@ class BasicHost(IHost):
                 len(identify_msg.protocols),
                 peer_id,
             )
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "outbound"
+            event.peer_id = str(peer_id)
+            event.success = True
+            self.get_event_bus().emit(event)
         except Exception as exc:
             logger.debug("Identify[%s]: error reading response: %s", reason, exc)
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "outbound"
+            event.peer_id = str(peer_id)
+            event.success = False
+            self.get_event_bus().emit(event)
             try:
                 await stream.reset()
             except Exception:

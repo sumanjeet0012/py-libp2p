@@ -29,6 +29,7 @@ from libp2p.custom_types import (
 from libp2p.io.abc import (
     ReadWriteCloser,
 )
+from libp2p.metrics.relay import RelayEvent
 from libp2p.network.connection.raw_connection import (
     RawConnection,
 )
@@ -643,8 +644,22 @@ class CircuitV2Protocol(Service):
 
                 logger.debug("Reservation response sent successfully")
 
+                reserve_event = RelayEvent()
+                reserve_event.reservation = True
+                reserve_event.side = "relay"
+                reserve_event.peer_id = str(peer_id)
+                reserve_event.action = (
+                    "refreshed" if "refreshed" in status_msg_text else "granted"
+                )
+                self.host.get_event_bus().emit(reserve_event)
+
         except Exception as e:
             logger.error("Error handling reservation request: %s", str(e))
+            reserve_event = RelayEvent()
+            reserve_event.reservation = True
+            reserve_event.side = "relay"
+            reserve_event.action = "failed"
+            self.host.get_event_bus().emit(reserve_event)
             if cast(INetStreamWithExtras, stream).is_open():
                 try:
                     # Send error response
@@ -784,6 +799,13 @@ class CircuitV2Protocol(Service):
             self._active_relays[peer_id] = (stream, dst_stream)
             logger.debug("Connection established for peer %s", peer_id)
 
+            hop_event = RelayEvent()
+            hop_event.hop_connect = True
+            hop_event.side = "relay"
+            hop_event.peer_id = str(peer_id)
+            hop_event.success = True
+            self.host.get_event_bus().emit(hop_event)
+
             # Update reservation connection count
             reservation = self.resource_manager.get_reservation(peer_id)
             if reservation:
@@ -814,6 +836,11 @@ class CircuitV2Protocol(Service):
 
         except (trio.TooSlowError, ConnectionError) as e:
             logger.error("Error establishing relay connection: %s", str(e))
+            hop_event = RelayEvent()
+            hop_event.hop_connect = True
+            hop_event.side = "relay"
+            hop_event.success = False
+            self.host.get_event_bus().emit(hop_event)
             logger.debug("Sending CONNECTION_FAILED status to source")
             relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             relay_envelope = unmarshal_envelope(relay_envelope_bytes)
@@ -828,6 +855,11 @@ class CircuitV2Protocol(Service):
                 await dst_stream.reset()
         except Exception as e:
             logger.error("Unexpected error in connect handler: %s", str(e))
+            hop_event = RelayEvent()
+            hop_event.hop_connect = True
+            hop_event.side = "relay"
+            hop_event.success = False
+            self.host.get_event_bus().emit(hop_event)
             relay_envelope_bytes, _ = env_to_send_in_RPC(self.host)
             relay_envelope = unmarshal_envelope(relay_envelope_bytes)
             await self._send_status(
@@ -901,6 +933,10 @@ class CircuitV2Protocol(Service):
                 try:
                     with trio.fail_after(self.write_timeout):
                         await dst_stream.write(data)
+                    bytes_event = RelayEvent()
+                    bytes_event.bytes_forwarded = True
+                    bytes_event.amount = bytes_transferred
+                    self.host.get_event_bus().emit(bytes_event)
                 except trio.TooSlowError:
                     logger.error("Timeout writing to destination stream")
                     break

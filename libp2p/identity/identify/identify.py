@@ -14,6 +14,7 @@ from libp2p.custom_types import (
     StreamHandlerFn,
     TProtocol,
 )
+from libp2p.metrics.identity import IdentityEvent
 from libp2p.network.stream.exceptions import (
     StreamClosed,
     StreamReset,
@@ -185,10 +186,28 @@ def identify_handler_for(
                 # Send raw protobuf message (old format for backward compatibility)
                 await stream.write(response)
             logger.debug("successfully handled request for %s from %s", ID, peer_id)
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "inbound"
+            event.peer_id = str(peer_id)
+            event.success = True
+            host.get_event_bus().emit(event)
         except (StreamClosed, StreamReset):
             logger.debug("Fail to respond to %s request: stream closed or reset", ID)
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "inbound"
+            event.peer_id = str(peer_id)
+            event.success = False
+            host.get_event_bus().emit(event)
         except MuxedStreamError:
             logger.debug("Fail to respond to %s request: muxed stream error", ID)
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "inbound"
+            event.peer_id = str(peer_id)
+            event.success = False
+            host.get_event_bus().emit(event)
             try:
                 await stream.reset()
             except Exception:
@@ -201,6 +220,12 @@ def identify_handler_for(
                 type(e),
                 traceback.format_exc(),
             )
+            event = IdentityEvent()
+            event.identify = True
+            event.direction = "inbound"
+            event.peer_id = str(peer_id)
+            event.success = False
+            host.get_event_bus().emit(event)
             try:
                 await stream.reset()
             except Exception:

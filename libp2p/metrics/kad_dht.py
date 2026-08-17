@@ -156,6 +156,11 @@ class KadDhtMetrics:
             "kad_routing_table_peers",
             "Number of peers currently in the routing table",
         )
+        self.record_validation_total = Counter(
+            "kad_record_validation_total",
+            "Record validation outcomes (namespace validate/select)",
+            labelnames=["type", "result"],
+        )
 
     def record(self, event: KadDhtEvent) -> None:
         if event.inbound:
@@ -228,3 +233,9 @@ class KadDhtMetrics:
 
         if event.routing_table and event.count is not None:
             self.routing_table_peers.set(event.count)
+
+        if event.record_validation:
+            result = "success" if event.success else "failure"
+            self.record_validation_total.labels(
+                type=event.record_type or "unknown", result=result
+            ).inc()

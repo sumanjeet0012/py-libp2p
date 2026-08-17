@@ -5,7 +5,18 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from libp2p.events import EventBus
+from libp2p.metrics.muxer import MuxerEvent, muxer_label
+from libp2p.metrics.security import (
+    SecurityEvent,
+    security_label_from_error,
+    security_protocol_label,
+)
 from libp2p.metrics.swarm import SwarmEvent
+from libp2p.metrics.transport import (
+    ListenConn,
+    TransportEvent,
+    transport_label,
+)
 from libp2p.rcmgr import Direction
 
 if TYPE_CHECKING:
@@ -1020,6 +1031,7 @@ class Swarm(Service, INetworkService):
         # For the dial to be successful, there needs to be a registered transport
         # that can dial the provided `maddr`
         transport = self.transport_manager.transport_for_dialing(addr)
+        transport_name = transport_label(transport=transport)
         if transport is None:
             raise SwarmException(
                 f"No registered transport can dial {addr}. "
@@ -1069,6 +1081,13 @@ class Swarm(Service, INetworkService):
                     pre_scope.close()
             except Exception:
                 pass
+            dial_event = TransportEvent()
+            dial_event.dial_out = True
+            dial_event.transport = transport_name
+            dial_event.success = False
+            dial_event.peer_id = str(peer_id)
+            dial_event.remote_maddr = str(addr)
+            self._event_bus.emit(dial_event)
             raise SwarmException(
                 f"fail to open connection to peer {peer_id}"
             ) from error
@@ -1079,6 +1098,13 @@ class Swarm(Service, INetworkService):
                     pre_scope.close()
             except Exception:
                 pass
+            dial_event = TransportEvent()
+            dial_event.dial_out = True
+            dial_event.transport = transport_name
+            dial_event.success = False
+            dial_event.peer_id = str(peer_id)
+            dial_event.remote_maddr = str(addr)
+            self._event_bus.emit(dial_event)
             raise SwarmException(f"Unexpected error dialing peer {peer_id}") from e
         except BaseException:
             # Clean up on BaseException like trio.Cancelled
@@ -1123,6 +1149,25 @@ class Swarm(Service, INetworkService):
                 except Exception:
                     pass
 
+                dial_event = TransportEvent()
+                dial_event.dial_out = True
+                dial_event.transport = transport_name
+                dial_event.success = True
+                dial_event.peer_id = str(peer_id)
+                dial_event.remote_maddr = str(addr)
+                self._event_bus.emit(dial_event)
+                muxer_event = MuxerEvent()
+                muxer_event.muxer_conn = True
+                muxer_event.muxer = transport_name
+                muxer_event.direction = "outbound"
+                muxer_event.success = True
+                muxer_event.peer_id = str(peer_id)
+                muxer_event.remote_maddr = str(addr)
+                muxer_event.protocol_id = getattr(
+                    self.upgrader.muxer_multistream, "last_selected_protocol", None
+                )
+                self._event_bus.emit(muxer_event)
+
                 return swarm_conn
             except BaseException:
                 # Clean up on failure or cancellation
@@ -1142,7 +1187,7 @@ class Swarm(Service, INetworkService):
             raise TypeError("Expected an IRawConnection to upgrade")
         try:
             swarm_conn = await self.upgrade_outbound_raw_conn(
-                raw_conn, peer_id, pre_scope
+                raw_conn, peer_id, pre_scope, remote_maddr=str(addr)
             )
         except BaseException:
             # Ensure raw_conn is closed if upgrade fails or is cancelled
@@ -1159,10 +1204,22 @@ class Swarm(Service, INetworkService):
 
         logger.debug("successfully dialed peer %s", peer_id)
 
+        dial_event = TransportEvent()
+        dial_event.dial_out = True
+        dial_event.transport = transport_name
+        dial_event.success = True
+        dial_event.peer_id = str(peer_id)
+        dial_event.remote_maddr = str(addr)
+        self._event_bus.emit(dial_event)
+
         return swarm_conn
 
     async def upgrade_outbound_raw_conn(
-        self, raw_conn: IRawConnection, peer_id: ID, pre_scope: Any = None
+        self,
+        raw_conn: IRawConnection,
+        peer_id: ID,
+        pre_scope: Any = None,
+        remote_maddr: str | None = None,
     ) -> "SwarmConn":
         """
         Secure the outgoing raw connection and upgrade it to a multiplexed connection.
@@ -1175,8 +1232,25 @@ class Swarm(Service, INetworkService):
         """
         secured_conn = None
         try:
+            security_start = time.monotonic()
             secured_conn = await self.upgrader.upgrade_security(raw_conn, True, peer_id)
+            security_duration_ms = (time.monotonic() - security_start) * 1000
         except SecurityUpgradeFailure as error:
+            security_event = SecurityEvent()
+            security_event.handshake = True
+            security_event.direction = "outbound"
+            security_event.peer_id = str(peer_id)
+            security_event.remote_maddr = remote_maddr
+            security_event.protocol = security_protocol_label(
+                self.upgrader.security_multistream.last_selected_protocol
+            )
+            if security_event.protocol == "unknown":
+                security_event.protocol = security_label_from_error(error)
+            security_event.protocol_id = getattr(
+                self.upgrader.security_multistream, "last_selected_protocol", None
+            )
+            security_event.success = False
+            self._event_bus.emit(security_event)
             logger.error("failed to upgrade security for peer %s: %s", peer_id, error)
             await raw_conn.close()
             try:
@@ -1188,6 +1262,21 @@ class Swarm(Service, INetworkService):
                 f"failed to upgrade security for peer {peer_id}: {error}"
             ) from error
         logger.debug("Swarm: security upgrade completed for peer %s", peer_id)
+
+        security_event = SecurityEvent()
+        security_event.handshake = True
+        security_event.direction = "outbound"
+        security_event.peer_id = str(peer_id)
+        security_event.remote_maddr = remote_maddr
+        security_event.protocol = security_protocol_label(
+            self.upgrader.security_multistream.last_selected_protocol
+        )
+        security_event.protocol_id = getattr(
+            self.upgrader.security_multistream, "last_selected_protocol", None
+        )
+        security_event.success = True
+        security_event.duration_ms = security_duration_ms
+        self._event_bus.emit(security_event)
 
         try:
             # Apply outbound upgrade timeout for muxer upgrade
@@ -1201,6 +1290,12 @@ class Swarm(Service, INetworkService):
                 f"Outbound muxer upgrade timeout ({timeout_val}s) "
                 f"exceeded for peer {peer_id}"
             )
+            muxer_event = MuxerEvent()
+            muxer_event.muxer_upgrade_failure = True
+            muxer_event.direction = "outbound"
+            muxer_event.peer_id = str(peer_id)
+            muxer_event.remote_maddr = remote_maddr
+            self._event_bus.emit(muxer_event)
             # Clean up secured connection
             try:
                 await secured_conn.close()
@@ -1217,6 +1312,12 @@ class Swarm(Service, INetworkService):
             )
         except MuxerUpgradeFailure as error:
             logger.debug("failed to upgrade mux for peer %s", peer_id)
+            muxer_event = MuxerEvent()
+            muxer_event.muxer_upgrade_failure = True
+            muxer_event.direction = "outbound"
+            muxer_event.peer_id = str(peer_id)
+            muxer_event.remote_maddr = remote_maddr
+            self._event_bus.emit(muxer_event)
             # Clean up secured connection
             try:
                 await secured_conn.close()
@@ -1249,6 +1350,18 @@ class Swarm(Service, INetworkService):
 
         logger.debug("Swarm: muxer upgrade completed for peer %s", peer_id)
         logger.debug("upgraded mux for peer %s", peer_id)
+
+        muxer_event = MuxerEvent()
+        muxer_event.muxer_conn = True
+        muxer_event.muxer = muxer_label(muxed_conn)
+        muxer_event.direction = "outbound"
+        muxer_event.success = True
+        muxer_event.peer_id = str(peer_id)
+        muxer_event.remote_maddr = remote_maddr
+        muxer_event.protocol_id = getattr(
+            self.upgrader.muxer_multistream, "last_selected_protocol", None
+        )
+        self._event_bus.emit(muxer_event)
 
         # Pass endpoint IP to resource manager for outbound
         if self._resource_manager is not None:
@@ -1413,6 +1526,11 @@ class Swarm(Service, INetworkService):
             net_stream._direction = Direction.OUTBOUND  # type: ignore[attr-defined]
             # RM resource now owned by the stream; cleared via notify_closed_stream
             rm_acquired = False
+            stream_event = MuxerEvent()
+            stream_event.stream_open = True
+            stream_event.direction = "outbound"
+            stream_event.peer_id = str(peer_id)
+            self._event_bus.emit(stream_event)
             return net_stream
 
         except BaseException:
@@ -1722,6 +1840,13 @@ class Swarm(Service, INetworkService):
         inbound_notification.conn_incoming = True
         self._event_bus.emit(inbound_notification)
 
+        transport_event = TransportEvent()
+        transport_event.conn_in = True
+        transport_event.transport = transport_label(maddr=maddr)
+        transport_event.success = True
+        transport_event.local_maddr = str(maddr)
+        self._event_bus.emit(transport_event)
+
         # Metric event for inbound connection failure
         failure_event = SwarmEvent()
 
@@ -1736,6 +1861,12 @@ class Swarm(Service, INetworkService):
                 "Inbound connection cap (%d) reached; rejecting new inbound connection",
                 int(self._inbound_limiter.total_tokens),
             )
+            transport_event = TransportEvent()
+            transport_event.conn_in = True
+            transport_event.transport = transport_label(maddr=maddr)
+            transport_event.success = False
+            transport_event.local_maddr = str(maddr)
+            self._event_bus.emit(transport_event)
             try:
                 await read_write_closer.close()
             except Exception:
@@ -1773,6 +1904,13 @@ class Swarm(Service, INetworkService):
                     # Emit event for incoming conn failure
                     failure_event.conn_incoming_error = True
                     self._event_bus.emit(failure_event)
+                    transport_event = TransportEvent()
+                    transport_event.conn_in = True
+                    transport_event.transport = transport_label(maddr=maddr)
+                    transport_event.success = False
+                    transport_event.local_maddr = str(maddr)
+                    transport_event.remote_maddr = str(remote_maddr)
+                    self._event_bus.emit(transport_event)
                 except Exception:
                     pass
                 return
@@ -1789,6 +1927,19 @@ class Swarm(Service, INetworkService):
                     "successfully opened pre-multiplexed inbound connection (peer=%s)",
                     peer_id,
                 )
+                muxer_event = MuxerEvent()
+                muxer_event.muxer_conn = True
+                muxer_event.muxer = transport_label(maddr=maddr)
+                muxer_event.direction = "inbound"
+                muxer_event.success = True
+                muxer_event.peer_id = (
+                    str(peer_id) if peer_id is not None else None
+                )
+                muxer_event.local_maddr = str(maddr)
+                muxer_event.protocol_id = getattr(
+                    self.upgrader.muxer_multistream, "last_selected_protocol", None
+                )
+                self._event_bus.emit(muxer_event)
                 # Intentional barrier: keep handler alive so the connection
                 # stays open for the duration of the swarm's lifetime.
                 await self.manager.wait_finished()
@@ -1797,6 +1948,12 @@ class Swarm(Service, INetworkService):
                 # Emit event for incoming conn failure
                 failure_event.conn_incoming_error = True
                 self._event_bus.emit(failure_event)
+                transport_event = TransportEvent()
+                transport_event.conn_in = True
+                transport_event.transport = transport_label(maddr=maddr)
+                transport_event.success = False
+                transport_event.local_maddr = str(maddr)
+                self._event_bus.emit(transport_event)
             return
 
         # Standard upgrade path (TCP, WebSocket): wrap in RawConnection then
@@ -1817,6 +1974,12 @@ class Swarm(Service, INetworkService):
                     # Emit event for incoming conn failure
                     failure_event.conn_incoming_error = True
                     self._event_bus.emit(failure_event)
+                    transport_event = TransportEvent()
+                    transport_event.conn_in = True
+                    transport_event.transport = transport_label(maddr=maddr)
+                    transport_event.success = False
+                    transport_event.local_maddr = str(maddr)
+                    self._event_bus.emit(transport_event)
             except Exception:
                 pass
 
@@ -1908,8 +2071,26 @@ class Swarm(Service, INetworkService):
             # handshake cannot hang indefinitely.
             with trio.fail_after(inbound_timeout):
                 try:
+                    security_start = time.monotonic()
                     secured_conn = await self.upgrader.upgrade_security(raw_conn, False)
+                    security_duration_ms = (time.monotonic() - security_start) * 1000
                 except SecurityUpgradeFailure as exc:
+                    security_event = SecurityEvent()
+                    security_event.handshake = True
+                    security_event.direction = "inbound"
+                    security_event.local_maddr = str(maddr)
+                    security_event.protocol = security_protocol_label(
+                        self.upgrader.security_multistream.last_selected_protocol
+                    )
+                    if security_event.protocol == "unknown":
+                        security_event.protocol = security_label_from_error(exc)
+                    security_event.protocol_id = getattr(
+                        self.upgrader.security_multistream,
+                        "last_selected_protocol",
+                        None,
+                    )
+                    security_event.success = False
+                    self._event_bus.emit(security_event)
                     # Expected churn on a public node: peers dial in that do
                     # not share a security protocol (or drop mid-handshake).
                     # Kubo logs these at debug; a full traceback per failure
@@ -1925,17 +2106,50 @@ class Swarm(Service, INetworkService):
                     ) from exc
                 peer_id = secured_conn.get_remote_peer()
 
+                security_event = SecurityEvent()
+                security_event.handshake = True
+                security_event.direction = "inbound"
+                security_event.peer_id = str(peer_id)
+                security_event.local_maddr = str(maddr)
+                security_event.protocol = security_protocol_label(
+                    self.upgrader.security_multistream.last_selected_protocol
+                )
+                security_event.protocol_id = getattr(
+                    self.upgrader.security_multistream, "last_selected_protocol", None
+                )
+                security_event.success = True
+                security_event.duration_ms = security_duration_ms
+                self._event_bus.emit(security_event)
+
                 try:
                     muxed_conn = await self.upgrader.upgrade_connection(
                         secured_conn, peer_id
                     )
                 except MuxerUpgradeFailure as error:
                     logger.error("fail to upgrade mux for peer %s", peer_id)
+                    muxer_event = MuxerEvent()
+                    muxer_event.muxer_upgrade_failure = True
+                    muxer_event.direction = "inbound"
+                    muxer_event.peer_id = str(peer_id)
+                    muxer_event.local_maddr = str(maddr)
+                    self._event_bus.emit(muxer_event)
                     await _cleanup_inbound_upgrade()
                     raise SwarmException(
                         f"fail to upgrade mux for peer {peer_id}"
                     ) from error
                 logger.debug("upgraded mux for peer %s", peer_id)
+
+                muxer_event = MuxerEvent()
+                muxer_event.muxer_conn = True
+                muxer_event.muxer = muxer_label(muxed_conn)
+                muxer_event.direction = "inbound"
+                muxer_event.success = True
+                muxer_event.peer_id = str(peer_id)
+                muxer_event.local_maddr = str(maddr)
+                muxer_event.protocol_id = getattr(
+                    self.upgrader.muxer_multistream, "last_selected_protocol", None
+                )
+                self._event_bus.emit(muxer_event)
         except trio.TooSlowError:
             logger.debug(
                 "Inbound upgrade timeout (%.1fs) exceeded for %s",
@@ -2427,6 +2641,41 @@ class Swarm(Service, INetworkService):
 
             # Call notifiers since event occurred
             await self.notify_connected(swarm_conn)
+
+            listen_conn_event = ListenConn()
+            listen_conn_event.conn_open = True
+            listen_conn_event.peer_id = str(peer_id)
+            conn_type_name = (
+                getattr(
+                    swarm_conn._connection_type,  # type: ignore[attr-defined]
+                    "value",
+                    str(swarm_conn._connection_type),
+                )
+                if getattr(swarm_conn, "_connection_type", None) is not None
+                else "unknown"
+            )
+            listen_conn_event.connection_type = conn_type_name
+            actual_addrs = getattr(swarm_conn, "_actual_transport_addresses", None)
+            if actual_addrs:
+                listen_conn_event.remote_maddr = ",".join(
+                    str(a) for a in actual_addrs
+                )
+            else:
+                try:
+                    remote = muxed_conn.get_remote_address()
+                    if remote:
+                        host, port = remote
+                        proto = "tcp"
+                        addr = (
+                            f"/ip6/{host}/{proto}/{port}"
+                            if ":" in host
+                            else f"/ip4/{host}/{proto}/{port}"
+                        )
+                        listen_conn_event.remote_maddr = addr
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            self._event_bus.emit(listen_conn_event)
+
             return swarm_conn
 
         except BaseException as exc:

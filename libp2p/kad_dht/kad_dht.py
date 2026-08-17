@@ -697,6 +697,7 @@ class KadDHT(Service):
 
                         # Metrics Event
                         event.find_node = True
+                        event.target = target_key.hex()
 
                         # Build response message with protobuf
                         response = Message()
@@ -785,6 +786,7 @@ class KadDHT(Service):
 
                         # Metrics Event
                         event.add_provider = True
+                        event.key = key.hex()
 
                         # Cap the number of providers per message
                         provider_count = 0
@@ -884,6 +886,7 @@ class KadDHT(Service):
 
                         # Metrics event
                         event.get_providers = True
+                        event.key = key.hex()
 
                         # Find providers for the key
                         providers = self.provider_store.get_providers(key)
@@ -968,6 +971,7 @@ class KadDHT(Service):
 
                         # Metrics Event
                         event.get_value = True
+                        event.key = key.hex()
 
                         value_record = self.value_store.get(key)
                         if value_record:
@@ -1091,6 +1095,7 @@ class KadDHT(Service):
                             break
 
                         event.put_value = True
+                        event.key = key.hex()
 
                         try:
                             if not (key and value):
@@ -1155,11 +1160,13 @@ class KadDHT(Service):
                                         f"{key.hex()}, rejecting PUT_VALUE"
                                     )
                                     success = False
+                                self._emit_record_validation(key_str, success)
                             else:
                                 # No existing record, store the new one
                                 self.value_store.put_record(key, cleaned_record)
                                 logger.debug(f"Stored value for key {key.hex()}")
                                 success = True
+                                self._emit_record_validation(key_str, True)
 
                         except Exception as e:
                             logger.warning(
@@ -1278,14 +1285,24 @@ class KadDHT(Service):
     async def refresh_routing_table(self) -> None:
         """Refresh the routing table."""
         logger.debug("Refreshing routing table")
+        refresh_start = time.monotonic()
+        peers_discovered: int = 0
+        peers_added: int = 0
         if getattr(self, "rt_refresh_manager", None) is not None:
-            await self.rt_refresh_manager._do_refresh(force=True)  # type: ignore
+            peers_discovered, peers_added = (
+                await self.rt_refresh_manager._do_refresh(  # type: ignore[union-attr]
+                    force=True
+                )
+            )
         else:
             await self.peer_routing.refresh_routing_table()
 
         refresh_event = KadDhtEvent()
         refresh_event.refresh = True
         refresh_event.success = True
+        refresh_event.peers_found = peers_discovered
+        refresh_event.peers_added = peers_added
+        refresh_event.duration_ms = (time.monotonic() - refresh_start) * 1000
         self.host.get_event_bus().emit(refresh_event)
 
     # Peer routing methods
@@ -1313,6 +1330,7 @@ class KadDHT(Service):
 
         """
         logger.debug(f"Storing value for key {key}")
+        put_start = time.monotonic()
 
         # Always validate the key-value pair using the namespaced validator
         # This will raise InvalidRecordType if:
@@ -1327,8 +1345,11 @@ class KadDHT(Service):
         old_value_record = self.value_store.get(key_bytes)
         if old_value_record is not None and old_value_record.value != value:
             index = self.validator.select(key, [value, old_value_record.value])
+            self._emit_record_validation(key, index == 0)
             if index != 0:
                 raise ValueError("Refusing to replace newer value with the older one")
+        else:
+            self._emit_record_validation(key, True)
 
         # 1. Store locally first
         self.value_store.put(key_bytes, value)
@@ -1380,6 +1401,9 @@ class KadDHT(Service):
         put_event.key = key
         put_event.peers_stored = stored_count_list[0]
         put_event.success = stored_count_list[0] > 0
+        put_event.value_size_bytes = len(value)
+        put_event.value_preview = self._value_preview(value)
+        put_event.duration_ms = (time.monotonic() - put_start) * 1000
         self.host.get_event_bus().emit(put_event)
 
     async def get_value(self, key: str, quorum: int = 0) -> bytes | None:
@@ -1400,6 +1424,7 @@ class KadDHT(Service):
 
         """
         logger.debug(f"Getting value for key: {key}")
+        get_start = time.monotonic()
 
         # Validate quorum parameter
         if quorum < 0:
@@ -1412,6 +1437,16 @@ class KadDHT(Service):
         value_record = self.value_store.get(key_bytes)
         if value_record:
             logger.debug("Found value locally")
+            get_event = KadDhtEvent()
+            get_event.get_value_out = True
+            get_event.key = key
+            get_event.value_found = True
+            get_event.success = True
+            get_event.found_locally = True
+            get_event.value_size_bytes = len(value_record.value)
+            get_event.value_preview = self._value_preview(value_record.value)
+            get_event.duration_ms = (time.monotonic() - get_start) * 1000
+            self.host.get_event_bus().emit(get_event)
             return value_record.value
 
         # 2. Get closest peers via network lookup (iterative FIND_NODE)
@@ -1654,6 +1689,11 @@ class KadDHT(Service):
             get_event.key = key
             get_event.value_found = True
             get_event.success = True
+            get_event.peers_queried = len(queried_peers)
+            get_event.peers_responded = [str(p) for p in peers_best][:10]
+            get_event.value_size_bytes = len(best_value)
+            get_event.value_preview = self._value_preview(best_value)
+            get_event.duration_ms = (time.monotonic() - get_start) * 1000
             self.host.get_event_bus().emit(get_event)
             return best_value
 
@@ -1665,6 +1705,8 @@ class KadDHT(Service):
         get_event.key = key
         get_event.value_found = False
         get_event.success = False
+        get_event.peers_queried = len(queried_peers)
+        get_event.duration_ms = (time.monotonic() - get_start) * 1000
         self.host.get_event_bus().emit(get_event)
         return None
 
@@ -1770,6 +1812,28 @@ class KadDHT(Service):
 
         """
         return self.enable_random_walk
+
+    def _emit_record_validation(self, key: str, success: bool) -> None:
+        """Emit a record-validation metric event for ``key`` in ``namespace``."""
+        event = KadDhtEvent()
+        event.record_validation = True
+        event.key = key
+        if key.startswith("/"):
+            parts = key.strip("/").split("/")
+            event.record_type = parts[0] if parts else "unknown"
+        else:
+            event.record_type = key
+        event.success = success
+        self.host.get_event_bus().emit(event)
+
+    @staticmethod
+    def _value_preview(value: bytes) -> str:
+        """Return a truncated, safe preview of a stored value for debugging."""
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return (value.hex()[:32] + "...") if len(value) > 16 else value.hex()
+        return (text[:32] + "...") if len(text) > 32 else text
 
     def get_diagnostics(self) -> RoutingTableDiagnostics:
         """

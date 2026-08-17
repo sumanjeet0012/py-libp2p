@@ -14,6 +14,8 @@ from libp2p.abc import (
     IMuxedStream,
     INetConn,
 )
+from libp2p.metrics.muxer import MuxerEvent
+from libp2p.metrics.transport import ListenConn
 from libp2p.network.stream.net_stream import (
     NetStream,
     StreamState,
@@ -143,6 +145,19 @@ class SwarmConn(INetConn):
             return
         logging.debug(f"Closing SwarmConn for peer {self.muxed_conn.peer_id}")
         self.event_closed.set()
+
+        conn_event = ListenConn()
+        conn_event.conn_close = True
+        conn_event.peer_id = str(self.muxed_conn.peer_id)
+        conn_event.connection_type = (
+            getattr(self._connection_type, "value", str(self._connection_type))
+            if getattr(self, "_connection_type", None) is not None
+            else "unknown"
+        )
+        actual_addrs = getattr(self, "_actual_transport_addresses", None)
+        if actual_addrs:
+            conn_event.remote_maddr = ",".join(str(a) for a in actual_addrs)
+        self.swarm._event_bus.emit(conn_event)
 
         # Clean up resource scope if it exists
         if self._resource_scope is not None:
@@ -279,6 +294,11 @@ class SwarmConn(INetConn):
         net_stream = await self._add_stream(muxed_stream)
         # Tag stream with direction so notify_closed_stream releases resources
         net_stream._direction = Direction.INBOUND
+        stream_event = MuxerEvent()
+        stream_event.stream_open = True
+        stream_event.direction = "inbound"
+        stream_event.peer_id = str(self.muxed_conn.peer_id)
+        self.swarm._event_bus.emit(stream_event)
         try:
             await self.swarm.common_stream_handler(net_stream)
         finally:
@@ -361,10 +381,16 @@ class SwarmConn(INetConn):
         if stream not in self.streams:
             return
         self.streams.remove(stream)
+        direction = str(getattr(stream, "_direction", Direction.UNKNOWN))
+        stream_event = MuxerEvent()
+        stream_event.stream_close = True
+        stream_event.direction = direction
+        stream_event.peer_id = str(self.muxed_conn.peer_id)
+        self.swarm._event_bus.emit(stream_event)
 
     async def _remove_stream(self, stream: NetStream) -> None:
         """Remove stream and notify about closure."""
         if stream not in self.streams:
             return
-        self.streams.remove(stream)
+        self.remove_stream(stream)
         await self.swarm.notify_closed_stream(stream)
