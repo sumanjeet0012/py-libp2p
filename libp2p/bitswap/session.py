@@ -9,6 +9,7 @@ from libp2p.peer.id import ID as PeerID
 from .cid import CIDObject, format_cid_for_display, parse_cid
 from .config import DEFAULT_TIMEOUT
 from .errors import TimeoutError as BitswapTimeoutError
+from .events import BitswapEvent
 
 if TYPE_CHECKING:
     from .cid import CIDInput
@@ -40,6 +41,12 @@ class BitswapSession:
         self._pending_requests: dict[CIDObject, set[trio.Event]] = {}
         # Track peers that have provided data
         self.active_peers: set[PeerID] = set()
+
+        # Emit session-created metric event
+        event = BitswapEvent()
+        event.session_new = True
+        event.cid = str(session_id)
+        client.host.get_event_bus().emit(event)
 
     async def get_block(
         self,

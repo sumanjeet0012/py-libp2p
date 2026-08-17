@@ -4,6 +4,7 @@ import random
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from libp2p.events import EventBus
 from libp2p.metrics.swarm import SwarmEvent
 from libp2p.rcmgr import Direction
 
@@ -187,6 +188,7 @@ class Swarm(Service, INetworkService):
         connection_config: ConnectionConfig | QUICTransportConfig | None = None,
         psk: str | None = None,
         metric_send_channel: trio.MemorySendChannel[Any] | None = None,
+        event_bus: EventBus | None = None,
         *,
         # Optional pre-built TransportManager (e.g. with a PortDemultiplexer attached
         # for shared-port TCP+WS demultiplexing).  When supplied, it is used as-is
@@ -272,6 +274,10 @@ class Swarm(Service, INetworkService):
 
         # Metrics
         self.metric_send_channel = metric_send_channel
+
+        # Event bus (INotifee-style listener fan-out). Created unconditionally
+        # so emitters are always safe; the host passes its own bus instance.
+        self._event_bus = event_bus if event_bus is not None else EventBus()
 
         # Inbound limiter initialized before connection management
         self._inbound_limiter: trio.CapacityLimiter = trio.CapacityLimiter(1)
@@ -685,9 +691,7 @@ class Swarm(Service, INetworkService):
         event = SwarmEvent()
         event.peer_id = peer_id.pretty()
         event.dial_attempt = True
-
-        if self.metric_send_channel is not None:
-            await self.metric_send_channel.send(event)
+        self._event_bus.emit(event)
 
         if self._negative_peer_cache.is_blocked(str(peer_id)):
             logger.debug(
@@ -883,9 +887,7 @@ class Swarm(Service, INetworkService):
                 event = SwarmEvent()
                 event.peer_id = peer_id.pretty()
                 event.dial_attempt_error = True
-
-                if self.metric_send_channel is not None:
-                    await self.metric_send_channel.send(event)
+                self._event_bus.emit(event)
 
                 self._negative_peer_cache.mark_failed(str(peer_id))
                 raise SwarmDialAllFailedError(
@@ -1718,8 +1720,7 @@ class Swarm(Service, INetworkService):
         # Emit a metric-event that we received an inbound connection
         inbound_notification = SwarmEvent()
         inbound_notification.conn_incoming = True
-        if self.metric_send_channel is not None:
-            await self.metric_send_channel.send(inbound_notification)
+        self._event_bus.emit(inbound_notification)
 
         # Metric event for inbound connection failure
         failure_event = SwarmEvent()
@@ -1771,8 +1772,7 @@ class Swarm(Service, INetworkService):
                     await read_write_closer.close()
                     # Emit event for incoming conn failure
                     failure_event.conn_incoming_error = True
-                    if self.metric_send_channel is not None:
-                        await self.metric_send_channel.send(failure_event)
+                    self._event_bus.emit(failure_event)
                 except Exception:
                     pass
                 return
@@ -1796,8 +1796,7 @@ class Swarm(Service, INetworkService):
                 await read_write_closer.close()
                 # Emit event for incoming conn failure
                 failure_event.conn_incoming_error = True
-                if self.metric_send_channel is not None:
-                    await self.metric_send_channel.send(failure_event)
+                self._event_bus.emit(failure_event)
             return
 
         # Standard upgrade path (TCP, WebSocket): wrap in RawConnection then
@@ -1817,8 +1816,7 @@ class Swarm(Service, INetworkService):
                     await read_write_closer.close()
                     # Emit event for incoming conn failure
                     failure_event.conn_incoming_error = True
-                    if self.metric_send_channel is not None:
-                        await self.metric_send_channel.send(failure_event)
+                    self._event_bus.emit(failure_event)
             except Exception:
                 pass
 

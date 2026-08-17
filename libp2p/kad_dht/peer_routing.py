@@ -31,6 +31,7 @@ from .common import (
     PROTOCOL_ID,
     QUERY_TIMEOUT,
 )
+from .events import KadDhtEvent
 from .pb.kademlia_pb2 import (
     Message,
 )
@@ -70,7 +71,7 @@ class PeerRouting(IPeerRouting):
 
     async def find_peer(self, peer_id: ID) -> PeerInfo | None:
         """
-        Find a peer with the given ID.
+        Find a peer with the given ID (emits a metric event).
 
         :param peer_id: The ID of the peer to find
 
@@ -80,6 +81,16 @@ class PeerRouting(IPeerRouting):
             The peer information if found, None otherwise
 
         """
+        result = await self._find_peer_impl(peer_id)
+        event = KadDhtEvent()
+        event.find_peer = True
+        event.target = str(peer_id)
+        event.success = result is not None
+        self.host.get_event_bus().emit(event)
+        return result
+
+    async def _find_peer_impl(self, peer_id: ID) -> PeerInfo | None:
+        """Find a peer with the given ID (no metric emission)."""
         # Check if this is actually our peer ID
         if peer_id == self.host.get_id():
             try:
@@ -238,6 +249,13 @@ class PeerRouting(IPeerRouting):
         # Return early if we have no peers to start with
         if not closest_peers:
             logger.debug("No local peers available for network lookup")
+            self._emit_lookup_event(
+                target_key,
+                query_count=0,
+                peers_found=0,
+                start_time=start_time,
+                success=False,
+            )
             return []
 
         # Iterative lookup using a semaphore-based sliding window.
@@ -345,7 +363,33 @@ class PeerRouting(IPeerRouting):
             f"Network lookup completed after {rounds} rounds "
             f"({query_count} queries), found {len(closest_peers)} peers"
         )
+        self._emit_lookup_event(
+            target_key,
+            query_count=query_count,
+            peers_found=len(closest_peers),
+            start_time=start_time,
+            success=len(closest_peers) > 0,
+        )
         return closest_peers
+
+    def _emit_lookup_event(
+        self,
+        target_key: bytes,
+        *,
+        query_count: int,
+        peers_found: int,
+        start_time: float,
+        success: bool,
+    ) -> None:
+        """Emit a Kad-DHT lookup event on the host's event bus."""
+        event = KadDhtEvent()
+        event.lookup = True
+        event.target = target_key.hex()
+        event.duration_ms = (trio.current_time() - start_time) * 1000
+        event.peers_queried = query_count
+        event.peers_found = peers_found
+        event.success = success
+        self.host.get_event_bus().emit(event)
 
     async def _query_peer_for_closest(self, peer: ID, target_key: bytes) -> list[ID]:
         """

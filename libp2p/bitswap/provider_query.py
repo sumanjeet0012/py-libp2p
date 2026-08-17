@@ -19,6 +19,7 @@ import trio
 from libp2p.peer.id import ID as PeerID
 
 from .cid import CIDInput, cid_to_bytes, format_cid_for_display
+from .events import BitswapEvent
 
 if TYPE_CHECKING:
     from libp2p.kad_dht.kad_dht import KadDHT
@@ -319,6 +320,15 @@ class ProviderQueryManager:
         logger.info(
             f"Provider discovery complete: {len(results)}/{len(cids)} CIDs resolved"
         )
+
+        # Emit provider-query metric event (one per batch, providers found)
+        total_found = sum(len(providers) for providers in results.values())
+        event = BitswapEvent()
+        event.provider_query = True
+        event.cid = str(len(cids))
+        event.peers_found = total_found
+        event.success = len(results) > 0
+        self.dht.host.get_event_bus().emit(event)
 
         return results
 

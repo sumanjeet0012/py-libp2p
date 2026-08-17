@@ -5,8 +5,11 @@ from typing import Any
 from prometheus_client import start_http_server
 import trio
 
+from libp2p.events import EventBus
 from libp2p.host.ping import PingEvent
-from libp2p.kad_dht.kad_dht import KadDhtEvent
+from libp2p.kad_dht.events import KadDhtEvent
+from libp2p.metrics.bitswap import BitswapMetrics
+from libp2p.metrics.discovery import DiscoveryMetrics
 from libp2p.metrics.gossipsub import GossipsubMetrics
 from libp2p.metrics.kad_dht import KadDhtMetrics
 from libp2p.metrics.ping import PingMetrics
@@ -35,12 +38,47 @@ class Metrics:
     gossipsub: GossipsubMetrics
     kad_dht: KadDhtMetrics
     swarm: SwarmMetrics
+    bitswap: BitswapMetrics
+    discovery: DiscoveryMetrics
 
     def __init__(self) -> None:
         self.ping = PingMetrics()
         self.gossipsub = GossipsubMetrics()
         self.kad_dht = KadDhtMetrics()
         self.swarm = SwarmMetrics()
+        self.bitswap = BitswapMetrics()
+        self.discovery = DiscoveryMetrics()
+
+    def attach(self, event_bus: EventBus) -> "Metrics":
+        """
+        Register a metrics listener on ``event_bus`` and return self.
+
+        From this point on, every event emitted on the bus (DHT lookups,
+        Bitswap block transfers, discovery events, pubsub messages, ping
+        RTTs, swarm dials) is recorded into these Prometheus metrics.
+
+        Example::
+
+            metrics = Metrics()
+            metrics.attach(host.get_event_bus())
+            metrics.start_http_server()
+        """
+        from libp2p.metrics.listener import MetricsListener
+
+        event_bus.register_listener(MetricsListener(self))
+        return self
+
+    def start_http_server(self, port: int | None = None) -> int:
+        """
+        Start the Prometheus HTTP scrape endpoint and return its port.
+
+        Unlike :meth:`start_prometheus_server` (the legacy channel-based
+        consumer), this only exposes the metrics registry over HTTP — event
+        consumption is handled by :meth:`attach` instead.
+        """
+        port = find_available_port(port if port is not None else 8000)
+        start_http_server(port)
+        return port
 
     async def start_prometheus_server(
         self,

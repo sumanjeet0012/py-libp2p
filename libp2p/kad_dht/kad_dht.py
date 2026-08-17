@@ -72,6 +72,7 @@ from .common import (
     format_time_rfc3339,
     parse_time_received,
 )
+from .events import KadDhtEvent
 from .pb.kademlia_pb2 import (
     Message,
     Record,
@@ -146,17 +147,6 @@ def _encode_key(key: str) -> bytes:
         return bytes.fromhex(key)
     except ValueError:
         return key.encode("utf-8")
-
-
-class KadDhtEvent:
-    peer_id: str
-
-    inbound: bool = False
-    find_node: bool = False
-    get_value: bool = False
-    put_value: bool = False
-    get_providers: bool = False
-    add_provider: bool = False
 
 
 class KadDHT(Service):
@@ -413,6 +403,13 @@ class KadDHT(Service):
                     logger.debug(f"Cleaned up {expired_values} expired values")
 
                 self.provider_store.cleanup_expired()
+
+                # Emit a routing-table snapshot (gauge) so metrics consumers
+                # can track routing-table health over time.
+                rt_event = KadDhtEvent()
+                rt_event.routing_table = True
+                rt_event.count = self.routing_table.size()
+                self.host.get_event_bus().emit(rt_event)
             except Exception as e:
                 logger.error(f"Error in DHT maintenance loop: {e}")
 
@@ -779,6 +776,10 @@ class KadDHT(Service):
 
                         # Rate limit check
                         if not self._check_provider_rate_limit(peer_id):
+                            rate_event = KadDhtEvent()
+                            rate_event.peer_id = peer_id.pretty()
+                            rate_event.rate_limited = True
+                            self.host.get_event_bus().emit(rate_event)
                             should_reset = True
                             break
 
@@ -1203,9 +1204,9 @@ class KadDHT(Service):
                     should_reset = True
                     break
 
-                # Send KAD-DHT event to Metrics
-                if stream.metric_send_channel is not None:
-                    await stream.metric_send_channel.send(event)
+                # Emit Kad-DHT event on the host's event bus (metrics listener
+                # and any other subscribers are notified).
+                self.host.get_event_bus().emit(event)
 
         except (trio.ClosedResourceError, trio.BrokenResourceError) as e:
             # Peer disconnected mid-stream — normal P2P behaviour, not a bug.
@@ -1226,6 +1227,11 @@ class KadDHT(Service):
             # Per spec: On any error in the handler, the stream is reset.
             # Only close gracefully if the handler completed without errors.
             if should_reset:
+                reset_event = KadDhtEvent()
+                reset_event.peer_id = peer_id.pretty()
+                reset_event.stream_reset = True
+                reset_event.reason = "protocol_violation"
+                self.host.get_event_bus().emit(reset_event)
                 try:
                     await stream.reset()
                 except Exception:
@@ -1276,6 +1282,11 @@ class KadDHT(Service):
             await self.rt_refresh_manager._do_refresh(force=True)  # type: ignore
         else:
             await self.peer_routing.refresh_routing_table()
+
+        refresh_event = KadDhtEvent()
+        refresh_event.refresh = True
+        refresh_event.success = True
+        self.host.get_event_bus().emit(refresh_event)
 
     # Peer routing methods
 
@@ -1363,6 +1374,13 @@ class KadDHT(Service):
                 nursery.start_soon(store_one, peer)
 
         logger.info(f"Successfully stored value at {stored_count_list[0]} peers")
+
+        put_event = KadDhtEvent()
+        put_event.put_value_out = True
+        put_event.key = key
+        put_event.peers_stored = stored_count_list[0]
+        put_event.success = stored_count_list[0] > 0
+        self.host.get_event_bus().emit(put_event)
 
     async def get_value(self, key: str, quorum: int = 0) -> bytes | None:
         """
@@ -1630,10 +1648,24 @@ class KadDHT(Service):
             # Store the best record locally (preserve original signature)
             self.value_store.put_record(key_bytes, best_rec)
             logger.info("Successfully retrieved value from network")
+
+            get_event = KadDhtEvent()
+            get_event.get_value_out = True
+            get_event.key = key
+            get_event.value_found = True
+            get_event.success = True
+            self.host.get_event_bus().emit(get_event)
             return best_value
 
         # 5. Not found
         logger.warning(f"Value not found for key {key}")
+
+        get_event = KadDhtEvent()
+        get_event.get_value_out = True
+        get_event.key = key
+        get_event.value_found = False
+        get_event.success = False
+        self.host.get_event_bus().emit(get_event)
         return None
 
     # Utility methods

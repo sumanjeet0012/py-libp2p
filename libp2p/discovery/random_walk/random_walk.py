@@ -5,6 +5,7 @@ import secrets
 import trio
 
 from libp2p.abc import IHost
+from libp2p.discovery.events.events import DiscoveryEvent
 from libp2p.discovery.random_walk.config import (
     RANDOM_WALK_CONCURRENCY,
     RANDOM_WALK_RT_THRESHOLD,
@@ -90,6 +91,7 @@ class RandomWalk:
 
             if not discovered_peer_ids:
                 logger.debug(f"No peers discovered in random walk for {key_desc}")
+                self._emit_walk_event(peers_found=0, success=False)
                 return []
 
             logger.info(
@@ -111,11 +113,22 @@ class RandomWalk:
                     logger.debug(f"Failed to create PeerInfo for {peer_id}: {e}")
                     continue
 
+            self._emit_walk_event(peers_found=len(validated_peers), success=True)
             return validated_peers
 
         except Exception as e:
             logger.error(f"Random walk failed: {e}")
+            self._emit_walk_event(peers_found=0, success=False)
             raise RandomWalkError(f"Random walk operation failed: {e}") from e
+
+    def _emit_walk_event(self, *, peers_found: int, success: bool) -> None:
+        """Emit a random-walk discovery event on the host's event bus."""
+        event = DiscoveryEvent()
+        event.random_walk = True
+        event.source = "random_walk"
+        event.peers_found = peers_found
+        event.success = success
+        self.host.get_event_bus().emit(event)
 
     async def run_concurrent_random_walks(
         self,

@@ -37,6 +37,10 @@ from libp2p.abc import (
     ISecureTransport,
     ITransport,
 )
+from libp2p.events import (
+    ChannelBridgeListener,
+    EventBus,
+)
 from libp2p.rcmgr import ResourceManager
 from libp2p.crypto.keys import (
     KeyPair,
@@ -446,6 +450,7 @@ def new_swarm(
     resource_manager: ResourceManager | None = None,
     psk: str | None = None,
     metric_send_channel: trio.MemorySendChannel[Any] | None = None,
+    event_bus: EventBus | None = None,
 ) -> INetworkService:
     """
     Create a swarm instance with multi-transport support.
@@ -648,6 +653,7 @@ def new_swarm(
         connection_config=connection_config,
         psk=psk,
         metric_send_channel=metric_send_channel,
+        event_bus=event_bus,
         transport_manager=transport_manager,
     )
 
@@ -746,10 +752,18 @@ def new_host(
     if not enable_quic and quic_transport_opt is not None:
         logger.warning("QUIC config provided but QUIC not enabled, ignoring QUIC config")
 
-    # Metric emit/consume endpoints
+    # Event bus (INotifee-style listener fan-out). Created unconditionally;
+    # with zero listeners, emit() is a near-free no-op.
+    event_bus = EventBus()
+
+    # Metric emit/consume endpoints (legacy channel pipeline). When metrics
+    # are enabled we bridge bus events into the legacy recv channel so the
+    # old ``Metrics.start_prometheus_server(recv_channel)`` consumer keeps
+    # working unchanged.
     metric_send_channel, metric_recv_channel = None, None
     if enable_metrics:
         metric_send_channel, metric_recv_channel = trio.open_memory_channel(100)
+        event_bus.register_listener(ChannelBridgeListener(metric_send_channel))
 
     # Enable automatic protection by default: if no resource manager is supplied,
     # create a default instance so connections/streams are guarded out of the box.
@@ -786,6 +800,7 @@ def new_host(
         resource_manager=resource_manager,
         psk=psk,
         metric_send_channel=metric_send_channel,
+        event_bus=event_bus,
         # NEW: forward multi-transport params
         transports=transports,
         enable_tcp=enable_tcp,
@@ -800,6 +815,7 @@ def new_host(
             enable_upnp=enable_upnp,
             bootstrap=bootstrap,
             resource_manager=resource_manager,
+            event_bus=event_bus,
             bootstrap_allow_ipv6=bootstrap_allow_ipv6,
             bootstrap_dns_timeout=bootstrap_dns_timeout,
             bootstrap_dns_max_retries=bootstrap_dns_max_retries,
@@ -813,6 +829,7 @@ def new_host(
         negotiate_timeout=negotiate_timeout,
         resource_manager=resource_manager,
         metric_recv_channel=metric_recv_channel,
+        event_bus=event_bus,
         bootstrap_allow_ipv6=bootstrap_allow_ipv6,
         bootstrap_dns_timeout=bootstrap_dns_timeout,
         bootstrap_dns_max_retries=bootstrap_dns_max_retries,

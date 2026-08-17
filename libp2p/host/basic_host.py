@@ -51,6 +51,7 @@ from libp2p.discovery.mdns.mdns import (
     create_mdns_discovery,
 )
 from libp2p.discovery.upnp.upnp import UpnpManager
+from libp2p.events import EventBus
 from libp2p.host.defaults import (
     get_default_protocols,
 )
@@ -223,6 +224,7 @@ class BasicHost(IHost):
         negotiate_timeout: int = DEFAULT_NEGOTIATE_TIMEOUT,
         resource_manager: ResourceManager | None = None,
         metric_recv_channel: trio.MemoryReceiveChannel[Any] | None = None,
+        event_bus: EventBus | None = None,
         *,
         bootstrap_allow_ipv6: bool = False,
         bootstrap_dns_timeout: float = 10.0,
@@ -259,6 +261,11 @@ class BasicHost(IHost):
         self._network.set_stream_handler(self._swarm_stream_handler)
         self.peerstore = self._network.peerstore
 
+        # Event bus (INotifee-style listener fan-out). Created unconditionally
+        # — with zero listeners, emit() is a no-op, so it is near-free even
+        # when metrics are disabled.
+        self._event_bus = event_bus if event_bus is not None else EventBus()
+
         # Coordinate negotiate_timeout with transport config if available
         # For QUIC transports, use the config value to ensure consistency
         if negotiate_timeout == DEFAULT_NEGOTIATE_TIMEOUT:
@@ -284,7 +291,9 @@ class BasicHost(IHost):
         self.multiselect_client = MultiselectClient()
         self.mDNS = None
         if enable_mDNS:
-            self.mDNS = create_mdns_discovery(network, host=self)
+            self.mDNS = create_mdns_discovery(
+                network, host=self, event_bus=self._event_bus
+            )
 
         # Initialize bootstrap discovery container. Keep attribute defined so
         # we can avoid hasattr checks elsewhere.
@@ -296,6 +305,7 @@ class BasicHost(IHost):
                 allow_ipv6=bootstrap_allow_ipv6,
                 dns_resolution_timeout=bootstrap_dns_timeout,
                 dns_max_retries=bootstrap_dns_max_retries,
+                event_bus=self._event_bus,
             )
 
         # Address announcement configuration (from #1268)
@@ -329,6 +339,10 @@ class BasicHost(IHost):
 
         # Metrics
         self.metric_recv_channel = metric_recv_channel
+
+    def get_event_bus(self) -> EventBus:
+        """Return the host's event bus (INotifee-style listener fan-out)."""
+        return self._event_bus
 
     def get_id(self) -> ID:
         """

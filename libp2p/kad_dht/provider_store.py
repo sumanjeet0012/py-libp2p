@@ -44,6 +44,7 @@ from .common import (
     PROTOCOL_ID,
     QUERY_TIMEOUT,
 )
+from .events import KadDhtEvent
 from .pb.kademlia_pb2 import (
     Message,
 )
@@ -197,12 +198,22 @@ class ProviderStore:
         providing_keys_snapshot = list(self.providing_keys)
 
         # Only republish keys that are due (last republish > 22h ago or never)
+        republished = 0
         for key in providing_keys_snapshot:
             last_republished = self._last_republish.get(key, 0)
             if (current_time - last_republished) >= PROVIDER_RECORD_REPUBLISH_INTERVAL:
                 logger.debug(f"Republishing provider record for key {key.hex()}")
                 await self.provide(key)
                 self._last_republish[key] = current_time
+                republished += 1
+
+        if republished > 0:
+            event = KadDhtEvent()
+            event.republish = True
+            event.record_type = "provider"
+            event.count = republished
+            event.success = True
+            self.host.get_event_bus().emit(event)
 
     async def provide(self, key: bytes) -> bool:
         """
@@ -270,6 +281,14 @@ class ProviderStore:
 
         success_count = success_count_list[0]
         logger.info(f"Successfully advertised to {success_count} peers")
+
+        # Emit provide metric event on the host's event bus
+        event = KadDhtEvent()
+        event.provide = True
+        event.key = key.hex()
+        event.peers_announced = success_count
+        event.success = success_count > 0
+        self.host.get_event_bus().emit(event)
         return success_count > 0
 
     async def _send_add_provider(self, peer_id: ID, key: bytes) -> bool:
@@ -373,6 +392,12 @@ class ProviderStore:
             logger.debug(
                 f"Found {len(local_providers)} providers locally for {key.hex()}"
             )
+            event = KadDhtEvent()
+            event.find_providers = True
+            event.key = key.hex()
+            event.providers_found = len(local_providers[:count])
+            event.success = True
+            self.host.get_event_bus().emit(event)
             return local_providers[:count]
 
         # Get initial closest peers
@@ -455,6 +480,13 @@ class ProviderStore:
                 break
 
         logger.debug(f"Found {len(all_providers)} providers for key {key.hex()}")
+
+        event = KadDhtEvent()
+        event.find_providers = True
+        event.key = key.hex()
+        event.providers_found = len(all_providers[:count])
+        event.success = len(all_providers) > 0
+        self.host.get_event_bus().emit(event)
         return all_providers[:count]
 
     async def _get_providers_from_peer_with_closers(

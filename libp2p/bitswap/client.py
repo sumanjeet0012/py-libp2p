@@ -40,6 +40,7 @@ from .errors import (
     BlockTooLargeError,
     MessageTooLargeError,
 )
+from .events import BitswapEvent
 from .message_queue import BitswapMessageQueue
 from .messages import create_message
 from .pb.bitswap_pb2 import Message
@@ -367,6 +368,12 @@ class BitswapClient(INotifee):
             f"(priority={priority}, type={'Have' if want_type else 'Block'})"
         )
 
+        # Emit wantlist-add metric event
+        event = BitswapEvent()
+        event.want_add = True
+        event.cid = format_cid_for_display(cid_obj)
+        self.host.get_event_bus().emit(event)
+
     async def have_block(self, cid: CIDInput, peer_id: PeerID | None = None) -> bool:
         """
         Check if a peer has a block (v1.2.0 feature).
@@ -439,6 +446,12 @@ class BitswapClient(INotifee):
             logger.debug(
                 f"Removed {format_cid_for_display(cid_obj, max_len=16)} from wantlist"
             )
+
+            # Emit wantlist-cancel metric event
+            event = BitswapEvent()
+            event.want_cancel = True
+            event.cid = format_cid_for_display(cid_obj)
+            self.host.get_event_bus().emit(event)
 
             # Send cancel message to all peers
             await self._broadcast_cancel(cid_obj)
@@ -755,6 +768,20 @@ class BitswapClient(INotifee):
         if msg.pendingBytes > 0:
             self._peer_pending_bytes[peer_id] = msg.pendingBytes
 
+        # Emit message-received metric event
+        kind = "wantlist" if msg.HasField("wantlist") else "blocks"
+        if msg.HasField("wantlist") and (msg.blocks or msg.payload):
+            kind = "mixed"
+        elif msg.blockPresences:
+            kind = "presence"
+        event = BitswapEvent()
+        event.peer_id = str(peer_id)
+        event.message_received = True
+        event.kind = kind
+        event.entries = len(msg.wantlist.entries) if msg.HasField("wantlist") else 0
+        event.msg_bytes = len(msg.SerializeToString())
+        self.host.get_event_bus().emit(event)
+
     async def _process_wantlist(
         self, wantlist: Message.Wantlist, peer_id: PeerID, stream: INetStream
     ) -> None:
@@ -965,6 +992,14 @@ class BitswapClient(INotifee):
                 await self.block_store.put_block(matched_cid, block_data)
                 logger.info("  ✓ Stored successfully")
 
+                # Emit block-received metric event
+                block_event = BitswapEvent()
+                block_event.peer_id = str(peer_id)
+                block_event.block_received = True
+                block_event.cid = format_cid_for_display(matched_cid)
+                block_event.size_bytes = len(block_data)
+                self.host.get_event_bus().emit(block_event)
+
                 # Record delivery for peer scoring
                 self.peer_manager.record_delivery(peer_id, matched_cid, len(block_data))
 
@@ -1032,6 +1067,14 @@ class BitswapClient(INotifee):
                 f"Received and stored block {format_cid_for_display(cid, max_len=16)} "
                 f"(v1.1.0+)"
             )
+
+            # Emit block-received metric event
+            block_event = BitswapEvent()
+            block_event.peer_id = str(peer_id)
+            block_event.block_received = True
+            block_event.cid = format_cid_for_display(cid)
+            block_event.size_bytes = len(data)
+            self.host.get_event_bus().emit(block_event)
 
             # Record delivery for peer scoring
             self.peer_manager.record_delivery(peer_id, cid, len(data))

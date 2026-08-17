@@ -36,6 +36,7 @@ from .common import (
     format_time_rfc3339,
     parse_time_received,
 )
+from .events import KadDhtEvent
 from .pb.kademlia_pb2 import Message, Record
 
 logger = logging.getLogger(__name__)
@@ -228,6 +229,7 @@ class ValueStore:
         # Snapshot to avoid mutation during iteration
         local_keys_snapshot = list(self.local_keys)
 
+        republished = 0
         for key in local_keys_snapshot:
             # Skip if not in store (may have been evicted)
             if key not in self.store:
@@ -257,8 +259,17 @@ class ValueStore:
                         logger.debug(f"Failed to republish to {peer_id}: {e}")
 
                 self._last_republish[key] = current_time
+                republished += 1
             except Exception as e:
                 logger.debug(f"Failed to republish record for key {key.hex()}: {e}")
+
+        if republished > 0:
+            event = KadDhtEvent()
+            event.republish = True
+            event.record_type = "value"
+            event.count = republished
+            event.success = True
+            self.host.get_event_bus().emit(event)
 
     async def _store_at_peer(
         self, peer_id: ID, key: bytes, value: bytes, record: Record | None = None

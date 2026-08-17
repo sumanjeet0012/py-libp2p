@@ -21,6 +21,7 @@ import varint
 from libp2p.abc import IHost, INetStream
 from libp2p.bitswap.cid import CIDObject
 from libp2p.bitswap.config import MAX_MESSAGE_SIZE
+from libp2p.bitswap.events import BitswapEvent
 from libp2p.bitswap.messages import create_message, create_wantlist_entry
 from libp2p.custom_types import TProtocol
 from libp2p.peer.id import ID as PeerID
@@ -291,6 +292,16 @@ class BitswapMessageQueue:
                 if current_v110_batch:
                     msg = create_message(blocks_v110=current_v110_batch)
                     await self._write_protobuf_message(stream, msg)
+
+            # Emit message-sent metric event (one per flush, summarizing the
+            # batched content that was written to the wire).
+            kind = "wantlist" if (entries or presences or full_wantlist) else "blocks"
+            event = BitswapEvent()
+            event.peer_id = str(self.peer_id)
+            event.message_sent = True
+            event.kind = kind
+            event.entries = len(entries)
+            self.host.get_event_bus().emit(event)
 
         except Exception as e:
             logger.debug(f"Error writing to Bitswap stream for {self.peer_id}: {e}")

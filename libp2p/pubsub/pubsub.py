@@ -309,13 +309,20 @@ MAX_CONCURRENT_VALIDATORS = 10
 
 
 class GossipsubEvent:
-    peer_id: str
+    peer_id: str | None = None
 
+    # Inbound
     publish: bool = False
     subopts: bool = False
     control: bool = False
-
     message_size: int | None = None
+
+    # Outbound / lifecycle
+    publish_out: bool = False
+    subscription_change: bool = False
+    topic: str | None = None
+    action: str | None = None
+    peers_sent: int | None = None
 
 
 class Pubsub(Service, IPubsub):
@@ -567,8 +574,7 @@ class Pubsub(Service, IPubsub):
                     )
                     await self.router.handle_rpc(rpc_incoming, peer_id)
 
-                if stream.metric_send_channel is not None:
-                    await stream.metric_send_channel.send(event)
+                self.host.get_event_bus().emit(event)
 
         except StreamEOF:
             logger.debug(
@@ -1270,6 +1276,14 @@ class Pubsub(Service, IPubsub):
         # Tell router we are joining this topic
         await self.router.join(topic_id)
 
+        # Emit subscription-change metric event
+        event = GossipsubEvent()
+        event.peer_id = self.my_id.pretty()
+        event.subscription_change = True
+        event.topic = topic_id
+        event.action = "subscribe"
+        self.host.get_event_bus().emit(event)
+
         # Return the subscription for messages on this topic
         return subscription
 
@@ -1299,6 +1313,14 @@ class Pubsub(Service, IPubsub):
 
         # Tell router we are leaving this topic
         await self.router.leave(topic_id)
+
+        # Emit subscription-change metric event
+        event = GossipsubEvent()
+        event.peer_id = self.my_id.pretty()
+        event.subscription_change = True
+        event.topic = topic_id
+        event.action = "unsubscribe"
+        self.host.get_event_bus().emit(event)
 
     async def message_all_peers(
         self, raw_msg: bytes, announce: rpc_pb2.RPC.SubOpts | None = None
@@ -1449,6 +1471,15 @@ class Pubsub(Service, IPubsub):
         await self.push_msg(self.my_id, msg)
 
         logger.debug("successfully published message %s", msg)
+
+        # Emit publish (outbound) metric event
+        event = GossipsubEvent()
+        event.peer_id = self.my_id.pretty()
+        event.publish_out = True
+        event.topic = ",".join(topic_ids)
+        event.message_size = len(msg.data)
+        event.peers_sent = len(self.peers)
+        self.host.get_event_bus().emit(event)
 
     async def validate_msg(
         self,

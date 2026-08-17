@@ -245,10 +245,8 @@ class PingService:
                 self._outbound_streams.pop(peer_id, None)
             raise
         finally:
-            ch = getattr(stream, "metric_send_channel", None)
-            if event is not None and ch is not None:
-                with trio.move_on_after(1):
-                    await ch.send(event)
+            if event is not None:
+                self._host.get_event_bus().emit(event)
 
     async def ping(self, peer_id: PeerID, ping_amt: int = 1) -> list[int]:
         """
