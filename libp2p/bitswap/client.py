@@ -75,6 +75,7 @@ class BitswapClient(INotifee):
         protocol_version: str = BITSWAP_PROTOCOL_V120,
         provider_query_manager: ProviderQueryManager | None = None,
         presence_ttl: float = 60.0,
+        max_broadcast_peers: int = -1,
     ) -> None:
         """
         Initialize a Bitswap client.
@@ -85,6 +86,8 @@ class BitswapClient(INotifee):
             protocol_version: The Bitswap protocol version string to prefer
             provider_query_manager: Optional manager to handle DHT provider queries
             presence_ttl: Time-to-live for block presence tracking (default 60s)
+            max_broadcast_peers: Hard cap on peers receiving each broadcast
+                (-1 = unlimited, matching go-libp2p's default)
 
         """
         self.host = host
@@ -93,6 +96,8 @@ class BitswapClient(INotifee):
         self.provider_query_manager: ProviderQueryManager | None = (
             provider_query_manager
         )
+        self.max_broadcast_peers = max_broadcast_peers
+        self._broadcast_cursor = 0
 
         self.protocol_handlers: dict[str, "IBitswapExtension"] = {}
         self.supported_protocols: list[str] = list(BITSWAP_PROTOCOLS)
@@ -113,11 +118,27 @@ class BitswapClient(INotifee):
 
         self._message_queues: dict[PeerID, BitswapMessageQueue] = {}
 
+        # Live broadcast wants (like go-libp2p's broadcastWants) and, per
+        # peer, the set of wants already sent — so re-broadcasts never
+        # duplicate and newly connected peers can be caught up immediately.
+        self._broadcast_wants: set[CIDObject] = set()
+        self._wants_sent_to_peer: dict[PeerID, set[CIDObject]] = {}
+
         self._nursery: trio.Nursery | None = None
         self._started = False
         self._cancel_scope: trio.CancelScope | None = None
         self._presence_cleanup_started = False
         self._notifee_registered = False
+
+        # Register stream handlers immediately instead of waiting for start().
+        # The host's listener may already be accepting connections by the time
+        # start() runs, and wants arriving before registration hit an
+        # unregistered protocol and were silently dropped.
+        for protocol in self.supported_protocols:
+            self.host.set_stream_handler(
+                TProtocol(protocol),
+                self._handle_stream,
+            )
 
     def get_or_create_message_queue(self, peer_id: PeerID) -> BitswapMessageQueue:
         """Get existing persistent MessageQueue for a peer or create a new one."""
@@ -154,12 +175,9 @@ class BitswapClient(INotifee):
         if self._started:
             return
 
-        # Set stream handler for all supported Bitswap protocols
-        for protocol in self.supported_protocols:
-            self.host.set_stream_handler(
-                TProtocol(protocol),
-                self._handle_stream,
-            )
+        # Stream handlers for all supported Bitswap protocols are registered in
+        # __init__ (before any listener starts), closing the init window in
+        # which inbound wants were dropped.
 
         self._started = True
         self._cancel_scope = trio.CancelScope()
@@ -241,7 +259,36 @@ class BitswapClient(INotifee):
         """No-op — Bitswap does not track stream close events."""
 
     async def connected(self, network: Any, conn: Any) -> None:
-        """No-op — per-peer state is created lazily on demand."""
+        """Send any live broadcast wants to a newly connected peer."""
+        peer_id = None
+        try:
+            if hasattr(conn, "muxed_conn") and conn.muxed_conn is not None:
+                peer_id = getattr(conn.muxed_conn, "peer_id", None)
+            if peer_id is None and hasattr(conn, "peer_id"):
+                peer_id = conn.peer_id
+            if peer_id is None and hasattr(conn, "get_remote_peer"):
+                peer_id = conn.get_remote_peer()
+        except Exception:
+            return
+
+        if peer_id is None or not self._broadcast_wants:
+            return
+
+        sent = self._wants_sent_to_peer.setdefault(peer_id, set())
+        unsent = [c for c in self._broadcast_wants if c not in sent]
+        if not unsent:
+            return
+
+        logger.info(
+            f"New peer {peer_id}: sending {len(unsent)} live broadcast wants"
+        )
+        try:
+            if self._nursery:
+                self._nursery.start_soon(self._send_wantlist_to_peer, peer_id, unsent)
+            else:
+                await self._send_wantlist_to_peer(peer_id, unsent)
+        except Exception as e:
+            logger.debug(f"Failed to catch up peer {peer_id}: {e}")
 
     async def disconnected(self, network: Any, conn: Any) -> None:
         """
@@ -292,6 +339,7 @@ class BitswapClient(INotifee):
         self._peer_pending_bytes.pop(peer_id, None)
         self.peer_manager.remove_peer(peer_id)
         self.presence_manager.remove_peer(peer_id)
+        self._wants_sent_to_peer.pop(peer_id, None)
         queue = self._message_queues.pop(peer_id, None)
         if queue is not None and self._nursery is not None:
             self._nursery.start_soon(queue.stop)
@@ -507,36 +555,65 @@ class BitswapClient(INotifee):
                 }
             msg_queue.add_wants(cids, want_infos=want_infos, full_wantlist=False)
             if not msg_queue._started:
-                await msg_queue.flush()
+                ok = await msg_queue.flush()
+                if not ok:
+                    # flush() requeued the wants; start a worker so they are
+                    # retried (with backoff) instead of being lost forever.
+                    if self._nursery is not None:
+                        msg_queue.start(self._nursery)
+                    return False
                 if self._nursery is None and msg_queue._stream is not None:
                     await self._read_responses_from_stream(
                         msg_queue._stream, peer_id, list(cids)
                     )
+            self._wants_sent_to_peer.setdefault(peer_id, set()).update(cids)
             return True
         except Exception as e:
             logger.error(f"Failed to send wantlist to peer {peer_id}: {e}")
             return False
 
     async def _broadcast_wantlist(self, cids: list[CIDObject]) -> None:
-        """Broadcast wantlist to all connected peers, with backpressure."""
-        import random
+        """Broadcast wantlist to all connected peers (go-libp2p semantics).
+
+        Sends to every connected peer that has not already received the want
+        (per-peer tracking), so re-broadcasts only reach peers that are still
+        missing it. An optional cap (``max_broadcast_peers``) bounds fan-out
+        per broadcast; when active, a rotating cursor guarantees every peer
+        is eventually covered.
+        """
+        for cid in cids:
+            self._broadcast_wants.add(cid)
 
         peers = list(self.host.get_network().connections.keys())
 
-        # Limit broadcast to a maximum number of peers to provide backpressure
-        # and prevent overwhelming the network or triggering GO_AWAY.
-        MAX_BROADCAST_PEERS = 20
-        if len(peers) > MAX_BROADCAST_PEERS:
-            peers = random.sample(peers, MAX_BROADCAST_PEERS)
+        if (
+            self.max_broadcast_peers >= 0
+            and len(peers) > self.max_broadcast_peers
+        ):
+            start = self._broadcast_cursor % len(peers)
+            peers = peers[start:] + peers[:start]
+            peers = peers[: self.max_broadcast_peers]
+            self._broadcast_cursor = start + self.max_broadcast_peers
 
         for peer_id in peers:
+            sent = self._wants_sent_to_peer.setdefault(peer_id, set())
+            unsent = [c for c in cids if c not in sent]
+            if not unsent:
+                continue
             if self._nursery:
-                self._nursery.start_soon(self._send_wantlist_to_peer, peer_id, cids)
+                self._nursery.start_soon(self._send_wantlist_to_peer, peer_id, unsent)
             else:
-                await self._send_wantlist_to_peer(peer_id, cids)
+                await self._send_wantlist_to_peer(peer_id, unsent)
 
     async def _broadcast_cancel(self, cid: CIDObject) -> None:
-        """Broadcast a cancel message to all connected peers via MessageQueue."""
+        """Broadcast a cancel message to all connected peers via MessageQueue.
+
+        Also forget the cancelled CID everywhere so a future want for it is
+        re-sent (mirrors go-libp2p's broadcast-cancel bookkeeping).
+        """
+        self._broadcast_wants.discard(cid)
+        for sent in self._wants_sent_to_peer.values():
+            sent.discard(cid)
         peers = list(self.host.get_network().connections.keys())
         for peer_id in peers:
             try:

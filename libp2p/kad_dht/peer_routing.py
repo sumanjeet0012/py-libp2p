@@ -300,78 +300,92 @@ class PeerRouting(IPeerRouting):
                 )
                 break
 
-            rounds += 1
-            logger.debug(f"Lookup round {rounds}/{MAX_PEER_LOOKUP_ROUNDS}")
+            try:
+                rounds += 1
+                logger.debug(f"Lookup round {rounds}/{MAX_PEER_LOOKUP_ROUNDS}")
 
-            # Admit at most ALPHA peers per round to preserve classic Kademlia
-            # iterative refinement: after each small batch we re-sort with any
-            # newly discovered peers before admitting the next batch.
-            # Exclude self - we can't query ourselves (Kubo does the same)
-            local_id = self.host.get_id()
-            peers_to_query = [
-                p for p in closest_peers if p not in queried_peers and p != local_id
-            ][:ALPHA]
-            if not peers_to_query:
-                logger.debug("No more unqueried peers available, ending lookup")
-                break
-
-            new_peers.clear()
-
-            async with trio.open_nursery() as nursery:
-                for peer in peers_to_query:
-                    await sem.acquire()
-                    queried_peers.add(peer)
-                    query_count += 1
-                    nursery.start_soon(_guarded_query, peer)
-
-            # If we got no new peers, check if there are still unqueried
-            # closest peers before terminating
-            if not new_peers:
-                unqueried_in_topk = [
+                # Admit at most ALPHA peers per round to preserve classic Kademlia
+                # iterative refinement: after each small batch we re-sort with any
+                # newly discovered peers before admitting the next batch.
+                # Exclude self - we can't query ourselves (Kubo does the same)
+                local_id = self.host.get_id()
+                peers_to_query = [
                     p
-                    for p in closest_peers[:BUCKET_SIZE]
+                    for p in closest_peers
                     if p not in queried_peers and p != local_id
+                ][:ALPHA]
+                if not peers_to_query:
+                    logger.debug("No more unqueried peers available, ending lookup")
+                    break
+
+                new_peers.clear()
+
+                async with trio.open_nursery() as nursery:
+                    for peer in peers_to_query:
+                        await sem.acquire()
+                        queried_peers.add(peer)
+                        query_count += 1
+                        nursery.start_soon(_guarded_query, peer)
+
+                # If we got no new peers, check if there are still unqueried
+                # closest peers before terminating
+                if not new_peers:
+                    unqueried_in_topk = [
+                        p
+                        for p in closest_peers[:BUCKET_SIZE]
+                        if p not in queried_peers and p != local_id
+                    ]
+                    if unqueried_in_topk:
+                        logger.debug(
+                            f"No new peers discovered but {len(unqueried_in_topk)} "
+                            "unqueried closest peers remain, continuing"
+                        )
+                        continue
+                    logger.debug("No new peers discovered and all closest queried")
+                    break
+
+                # Update our list of closest peers
+                all_candidates = list(dict.fromkeys(closest_peers + new_peers))
+                old_closest_peers = closest_peers[:]
+                closest_peers = sort_peer_ids_by_distance(target_key, all_candidates)[
+                    :count
                 ]
-                if unqueried_in_topk:
-                    logger.debug(
-                        f"No new peers discovered but {len(unqueried_in_topk)} "
-                        "unqueried closest peers remain, continuing"
-                    )
-                    continue
-                logger.debug("No new peers discovered and all closest queried")
-                break
+                logger.debug(f"Updated closest peers count: {len(closest_peers)}")
 
-            # Update our list of closest peers
-            all_candidates = list(dict.fromkeys(closest_peers + new_peers))
-            old_closest_peers = closest_peers[:]
-            closest_peers = sort_peer_ids_by_distance(target_key, all_candidates)[
-                :count
-            ]
-            logger.debug(f"Updated closest peers count: {len(closest_peers)}")
+                # Check if we made any progress (found closer peers)
+                if closest_peers == old_closest_peers:
+                    logger.debug("No improvement in closest peers, ending lookup")
+                    break
 
-            # Check if we made any progress (found closer peers)
-            if closest_peers == old_closest_peers:
-                logger.debug("No improvement in closest peers, ending lookup")
-                break
-
-            # Beta resiliency: ensure at least BETA of the closest peers
-            # have been queried before terminating
-            queried_in_closest = sum(
-                1 for p in closest_peers[:BUCKET_SIZE] if p in queried_peers
-            )
-            if queried_in_closest < BETA and len(closest_peers) >= BETA:
-                # Not enough closest peers queried, continue if we have candidates
-                unqueried_closest = [
-                    p
-                    for p in closest_peers[:BUCKET_SIZE]
-                    if p not in queried_peers and p != local_id
-                ]
-                if unqueried_closest:
-                    logger.debug(
-                        f"Only {queried_in_closest}/{BETA} closest peers queried, "
-                        "continuing lookup"
-                    )
-                    continue
+                # Beta resiliency: ensure at least BETA of the closest peers
+                # have been queried before terminating
+                queried_in_closest = sum(
+                    1 for p in closest_peers[:BUCKET_SIZE] if p in queried_peers
+                )
+                if queried_in_closest < BETA and len(closest_peers) >= BETA:
+                    # Not enough closest peers queried, continue if we have candidates
+                    unqueried_closest = [
+                        p
+                        for p in closest_peers[:BUCKET_SIZE]
+                        if p not in queried_peers and p != local_id
+                    ]
+                    if unqueried_closest:
+                        logger.debug(
+                            f"Only {queried_in_closest}/{BETA} closest peers queried, "
+                            "continuing lookup"
+                        )
+                        continue
+            except Exception as e:
+                logger.debug(f"Lookup round {rounds} error: {e}")
+                self._emit_lookup_event(
+                    target_key,
+                    query_count=query_count,
+                    peers_found=len(closest_peers),
+                    start_time=start_time,
+                    success=False,
+                    peers_responded=[str(p) for p in responding_peers][:10],
+                )
+                raise
 
         logger.info(
             f"Network lookup completed after {rounds} rounds "

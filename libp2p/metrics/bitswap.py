@@ -77,27 +77,29 @@ class BitswapMetrics:
         )
 
     def record(self, event: BitswapEvent) -> None:
+        # Independent ifs (not if/elif): an event may set several flags at
+        # once; elif would silently drop all but the first.
         if event.want_add:
             self.wantlist_adds.inc()
-        elif event.want_cancel:
+        if event.want_cancel:
             self.wantlist_cancels.inc()
-        elif event.block_received:
+        if event.block_received:
             self.blocks_received.inc()
             if event.size_bytes is not None:
                 self.block_received_bytes.observe(event.size_bytes)
-        elif event.block_sent:
+        if event.block_sent:
             self.blocks_sent.inc()
             if event.size_bytes is not None:
                 self.block_sent_bytes.observe(event.size_bytes)
-        elif event.message_sent:
+        if event.message_sent:
             self.message_sent.labels(kind=event.kind or "unknown").inc()
-        elif event.message_received:
+        if event.message_received:
             self.message_received.labels(kind=event.kind or "unknown").inc()
             if event.msg_bytes is not None:
                 self.message_received_bytes.observe(event.msg_bytes)
-        elif event.session_new:
+        if event.session_new:
             self.sessions.inc()
-        elif event.provider_query:
+        if event.provider_query:
             result = "success" if event.success else "failure"
             self.provider_queries.labels(result=result).inc()
             if event.peers_found is not None:

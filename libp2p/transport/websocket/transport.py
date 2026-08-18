@@ -720,37 +720,82 @@ class WebsocketTransport(ITransport):
 
         logger.debug(f"WebsocketTransport.dial connecting to {ws_url}")
 
-        # Apply timeout to the connection process
+        # Use background nursery if available (set by Swarm),
+        # otherwise create temporary one
+        if self._background_nursery is None:
+            raise OpenConnectionError(
+                "No background nursery available. "
+                "WebSocket transport requires Swarm to set background nursery."
+            )
+
+        # trio_websocket runs the connection's reader task in the nursery
+        # passed to connect_websocket_url. When the remote rejects the
+        # handshake (e.g. a plain HTTP/nginx endpoint that answers 404),
+        # the reader task raises ConnectionRejected. If that task ran in
+        # the *shared* Swarm background nursery, the exception would escape
+        # into the TrioManager nursery and crash the whole node.
+        #
+        # Each client connection therefore owns a private nursery hosted by
+        # a wrapper task; any reader/connect error is caught by the wrapper
+        # and delivered to the dialer as a result over a memory channel.
+        result_send, result_recv = trio.open_memory_channel[object](1)
+
+        async def _ws_client_host() -> None:
+            try:
+                async with trio.open_nursery() as conn_nursery:
+                    try:
+                        from trio_websocket import connect_websocket_url
+
+                        with trio.fail_after(self._config.handshake_timeout):
+                            ws = await connect_websocket_url(
+                                conn_nursery,
+                                ws_url,
+                                ssl_context=ssl_context,
+                                message_queue_size=1024,
+                                max_message_size=self._config.max_message_size,
+                            )
+                    except BaseException as exc:
+                        await result_send.send(exc)
+                        return
+
+                    conn = P2PWebSocketConnection(
+                        ws,
+                        None,  # local_addr will be set after upgrade
+                        is_secure=proto_info.is_wss,
+                        max_buffered_amount=self._config.max_buffered_amount,
+                    )
+                    try:
+                        await result_send.send(conn)
+                    except (trio.BrokenResourceError, trio.ClosedResourceError):
+                        return
+
+                    # Keep the private nursery (and the reader task) alive for
+                    # as long as the connection is open.
+                    while ws.closed is None:
+                        await trio.sleep(1)
+            except trio.Cancelled:
+                raise
+            except BaseException as exc:
+                # Reader/connection error after the handshake: deliver it to
+                # the dialer (if it is still listening) and exit; never let it
+                # propagate into the shared Swarm background nursery.
+                try:
+                    await result_send.send(exc)
+                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                    pass
+                except BaseException:
+                    pass
+
+        self._background_nursery.start_soon(_ws_client_host)
+
+        # Apply timeout to the connection process. The wrapper task enforces
+        # the same timeout on its side; the receive below unblocks as soon as
+        # either the connection or the error is delivered.
         with trio.fail_after(self._config.handshake_timeout):
-            from trio_websocket import connect_websocket_url
-
-            # Use background nursery if available (set by Swarm),
-            # otherwise create temporary one
-            if self._background_nursery is None:
-                raise OpenConnectionError(
-                    "No background nursery available. "
-                    "WebSocket transport requires Swarm to set background nursery."
-                )
-
-            # Create the WebSocket connection using the Swarm's background nursery
-            # This nursery stays alive for the lifetime of the Swarm service
-            ws = await connect_websocket_url(
-                self._background_nursery,
-                ws_url,
-                ssl_context=ssl_context,
-                message_queue_size=1024,
-                max_message_size=self._config.max_message_size,
-            )
-
-            # Create our connection wrapper
-            conn = P2PWebSocketConnection(
-                ws,
-                None,  # local_addr will be set after upgrade
-                is_secure=proto_info.is_wss,
-                max_buffered_amount=self._config.max_buffered_amount,
-            )
-
-            return conn
+            result = await result_recv.receive()
+        if isinstance(result, BaseException):
+            raise OpenConnectionError(f"Failed to dial {ws_url}: {result}") from result
+        return result
 
     async def _create_proxy_connection(
         self,

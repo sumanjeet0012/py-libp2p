@@ -55,6 +55,13 @@ class BitswapMessageQueue:
         self._started = False
         self.negotiated_protocol: str | None = None
 
+        # Retry backoff for transient dial/stream failures. A failed flush
+        # requeues its payload and retries with exponential backoff instead of
+        # silently dropping wants/blocks (which left peers hanging forever).
+        self._retry_delay = 0.25
+        self._initial_retry_delay = 0.25
+        self._max_retry_delay = 30.0
+
         # Buffers for coalescing messages
         self._pending_wants: dict[CIDObject, dict[str, Any]] = {}
         self._pending_cancels: set[CIDObject] = set()
@@ -174,12 +181,39 @@ class BitswapMessageQueue:
                     if self.debounce_delay > 0:
                         await trio.sleep(self.debounce_delay)
 
-                    await self.flush()
+                    ok = await self.flush()
+                    if not ok:
+                        # flush() requeued the payload; back off before the
+                        # next attempt so transient failures don't hot-loop.
+                        await trio.sleep(self._retry_delay)
+                        self._retry_delay = min(
+                            self._retry_delay * 2, self._max_retry_delay
+                        )
+                        if self._has_pending():
+                            self._notify_event.set()
+                    else:
+                        self._retry_delay = self._initial_retry_delay
         except trio.Cancelled:
             pass
 
-    async def flush(self) -> None:
-        """Snapshot, drain, and send all pending items over the stream."""
+    def _has_pending(self) -> bool:
+        """True if any coalesced payload is awaiting transmission."""
+        return bool(
+            self._pending_wants
+            or self._pending_cancels
+            or self._pending_presences
+            or self._pending_blocks_v100
+            or self._pending_blocks_v110
+            or self._full_wantlist
+        )
+
+    async def flush(self) -> bool:
+        """Snapshot, drain, and send all pending items over the stream.
+
+        Returns True when the payload was handed to the transport. On failure
+        the drained items are requeued, so a transient dial or stream error
+        cannot silently drop wants/blocks.
+        """
         async with self._lock:
             wants: dict[CIDObject, dict[str, Any]] = {
                 k: v for k, v in self._pending_wants.items()
@@ -204,7 +238,7 @@ class BitswapMessageQueue:
         if not (
             wants or cancels or presences or blocks_v100 or blocks_v110 or full_wantlist
         ):
-            return
+            return True
 
         # Prepare wantlist entries
         entries = []
@@ -228,13 +262,28 @@ class BitswapMessageQueue:
             )
 
         # Stream and send messages in chunks under MAX_MESSAGE_SIZE
-        await self._flush_messages(
+        ok = await self._flush_messages(
             entries=entries,
             presences=presences,
             blocks_v100=blocks_v100,
             blocks_v110=blocks_v110,
             full_wantlist=full_wantlist,
         )
+        if not ok:
+            # Requeue everything so the next cycle retries instead of losing
+            # the payload (wants that were never sent leave peers hanging).
+            async with self._lock:
+                for cid, info in wants.items():
+                    self._pending_wants[cid] = info
+                for cid in cancels:
+                    self._pending_cancels.add(cid)
+                for cid, has_block in presences:
+                    self._pending_presences[cid] = has_block
+                self._pending_blocks_v100 = blocks_v100 + self._pending_blocks_v100
+                self._pending_blocks_v110 = blocks_v110 + self._pending_blocks_v110
+                if full_wantlist:
+                    self._full_wantlist = True
+        return ok
 
     async def _flush_messages(
         self,
@@ -243,12 +292,16 @@ class BitswapMessageQueue:
         blocks_v100: list[bytes],
         blocks_v110: list[tuple[bytes, bytes]],
         full_wantlist: bool,
-    ) -> None:
-        """Send all batched messages over the reused stream."""
+    ) -> bool:
+        """Send all batched messages over the reused stream.
+
+        Returns False (without sending) if no stream can be opened or a write
+        fails; the caller requeues the payload for a later retry.
+        """
         stream = await self._get_or_open_stream()
         if stream is None:
             # Peer unreachable or stream negotiation failed
-            return
+            return False
 
         try:
             # 1. Send wantlist entries and block presences
@@ -302,6 +355,7 @@ class BitswapMessageQueue:
             event.kind = kind
             event.entries = len(entries)
             self.host.get_event_bus().emit(event)
+            return True
 
         except Exception as e:
             logger.debug(f"Error writing to Bitswap stream for {self.peer_id}: {e}")
@@ -313,6 +367,7 @@ class BitswapMessageQueue:
                     except Exception:
                         pass
                     self._stream = None
+            return False
 
     async def _write_protobuf_message(self, stream: INetStream, msg: Any) -> None:
         """Serialize and write a varint length-prefixed protobuf message."""

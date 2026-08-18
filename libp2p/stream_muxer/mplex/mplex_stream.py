@@ -172,10 +172,10 @@ class MplexStream(IMuxedStream):
                         # we are waiting for `receive`.
                         if self.event_reset.is_set():
                             raise MplexStreamReset
-                        raise Exception(
-                            "`incoming_data_channel` is closed but stream is not reset."
-                            "This should never happen."
-                        ) from error
+                        # The channel can also be closed by the peer closing
+                        # the stream while we wait — treat it as a normal EOF
+                        # instead of crashing the muxer task.
+                        raise MplexStreamEOF from error
             self._buf.extend(self._read_return_when_blocked())
             payload = self._buf[:n]
             self._buf = self._buf[len(payload) :]

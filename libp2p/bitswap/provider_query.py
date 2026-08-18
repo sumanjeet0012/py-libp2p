@@ -346,6 +346,7 @@ class ProviderQueryManager:
         async with self.query_semaphore:
             self._stats["queries"] += 1
             query_start = time.monotonic()
+            providers: list[PeerID] = []
 
             try:
                 with trio.fail_after(timeout):
@@ -381,17 +382,6 @@ class ProviderQueryManager:
                             f"{format_cid_for_display(cid, max_len=12)}"
                         )
 
-                    # Emit one provider-query event per CID with the exact
-                    # providers found (bounded to keep payloads small).
-                    event = BitswapEvent()
-                    event.provider_query = True
-                    event.cid = format_cid_for_display(cid)
-                    event.peers_found = len(providers)
-                    event.success = len(providers) > 0
-                    event.duration_ms = (time.monotonic() - query_start) * 1000
-                    event.providers = [str(p) for p in providers][:10]
-                    self.dht.host.get_event_bus().emit(event)
-
             except trio.TooSlowError:
                 self._stats["errors"] += 1
                 logger.warning(
@@ -401,6 +391,19 @@ class ProviderQueryManager:
                 self._stats["errors"] += 1
                 cid_disp = format_cid_for_display(cid, max_len=12)
                 logger.error(f"DHT query error for {cid_disp}: {e}")
+
+            # Emit one provider-query event per CID, always — including
+            # timeouts and failures. Previously the event was only emitted on
+            # the success path, so bitswap_provider_queries_total stayed 0
+            # while real (failing) queries were running.
+            event = BitswapEvent()
+            event.provider_query = True
+            event.cid = format_cid_for_display(cid)
+            event.peers_found = len(providers)
+            event.success = len(providers) > 0
+            event.duration_ms = (time.monotonic() - query_start) * 1000
+            event.providers = [str(p) for p in providers][:10]
+            self.dht.host.get_event_bus().emit(event)
 
     async def find_providers_single(
         self,
