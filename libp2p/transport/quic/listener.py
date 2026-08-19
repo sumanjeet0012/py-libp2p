@@ -822,6 +822,15 @@ class QUICListener(IListener):
                     await self._promote_pending_connection(
                         quic_conn, addr, destination_connection_id
                     )
+                    # The connection's own event loop must process
+                    # HandshakeCompleted (it sets _handshake_completed,
+                    # extracts the peer certificate, and signals the
+                    # connected event). Re-queue it so the event is not
+                    # lost when promotion consumed it here, then stop
+                    # draining: the promoted connection's loop handles all
+                    # remaining events (including the re-queued one).
+                    quic_conn._events.append(event)
+                    break
 
                 elif isinstance(event, events.ProtocolNegotiated):
                     # If handshake is complete, promote connection immediately

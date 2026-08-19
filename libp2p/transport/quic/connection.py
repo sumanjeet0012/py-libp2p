@@ -3,7 +3,7 @@ QUIC Connection implementation.
 Manages bidirectional QUIC connections with integrated stream multiplexing.
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 import logging
 import socket
@@ -139,6 +139,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         self._streams: dict[int, QUICStream] = {}
         self._stream_cache: dict[int, QUICStream] = {}  # Cache for frequent lookups
+        self._recently_closed_streams: deque[int] = deque(maxlen=128)
         self._next_stream_id: int = self._calculate_initial_stream_id()
         self._stream_handler: TQUICStreamHandlerFn | None = None
 
@@ -223,6 +224,24 @@ class QUICConnection(IRawConnection, IMuxedConn):
         # Performance monitoring thresholds
         self.SLOW_NOTIFICATION_THRESHOLD_SECONDS = 0.01  # 10ms
 
+        # Keep-alive: send PING frames on idle connections (kubo parity:
+        # quic-go sends a PING every 15 s and closes connections idle for 30 s).
+        keepalive_enabled = getattr(
+            self._transport._config, "KEEPALIVE_ENABLED", True
+        )
+        if not isinstance(keepalive_enabled, bool):
+            keepalive_enabled = True
+        keepalive_interval = getattr(
+            self._transport._config, "KEEPALIVE_INTERVAL", 15.0
+        )
+        if not isinstance(keepalive_interval, (int, float)):
+            keepalive_interval = 15.0
+        self._keepalive_interval = (
+            float(keepalive_interval) if keepalive_enabled else 0.0
+        )
+        self._last_transmit_time = time.time()
+        self._ping_uid_counter = 0
+
         # Performance and monitoring
         self._connection_start_time = time.time()
         self._stats = {
@@ -237,6 +256,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
             "connection_ids_issued": 0,
             "connection_ids_retired": 0,
             "connection_id_changes": 0,
+            "keepalive_pings_sent": 0,
         }
 
         logger.debug(
@@ -994,6 +1014,10 @@ class QUICConnection(IRawConnection, IMuxedConn):
             stream = self._streams.pop(stream_id)
             # Remove from cache too
             self._stream_cache.pop(stream_id, None)
+            # Remember the id so late/duplicate events (retransmissions of
+            # FIN/reset frames) don't spawn a "ghost" wrapper for a stream
+            # that was already handled and closed.
+            self._recently_closed_streams.append(stream_id)
 
             # Update stream counts asynchronously
             async def update_counts() -> None:
@@ -1093,6 +1117,32 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
             if not stream:
                 if self._is_incoming_stream(stream_id):
+                    if stream_id in self._recently_closed_streams:
+                        # Late event for a stream we already handled and
+                        # closed (e.g. queued FIN/reset retransmission).
+                        # Re-creating a wrapper here spawns a "ghost" inbound
+                        # stream whose writes fail (aioquic may have reset the
+                        # send side) and shows up as an instantly-reset
+                        # negotiation.
+                        logger.debug(
+                            "Ignoring late event for closed inbound stream %s",
+                            stream_id,
+                        )
+                        continue
+                    if stream_id not in self._quic._streams:
+                        # Late/duplicate events for a stream aioquic already
+                        # discarded (e.g. queued FIN after the stream finished
+                        # and was GC'd). Re-creating a wrapper here spawns a
+                        # "ghost" inbound stream whose writes fail with
+                        # "Cannot send data on unknown peer-initiated stream"
+                        # and shows up as an instantly-reset negotiation.
+                        logger.debug(
+                            "Ignoring late event for discarded inbound stream %s "
+                            "(aioquic no longer tracks it, %d streams left)",
+                            stream_id,
+                            len(self._quic._streams),
+                        )
+                        continue
                     try:
                         stream = await self._create_inbound_stream(stream_id)
                     except QUICStreamLimitError:
@@ -1148,6 +1198,30 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
     async def _create_inbound_stream(self, stream_id: int) -> QUICStream:
         """Create inbound stream with proper limit checking."""
+        if stream_id in self._recently_closed_streams:
+            # Late event for a stream we already handled and closed (e.g.
+            # queued FIN/reset retransmission). Re-creating a wrapper here
+            # spawns a "ghost" inbound stream whose writes fail - aioquic may
+            # have already reset the send side ("cannot call write() after
+            # reset()") or dropped the stream entirely.
+            logger.debug(
+                "Ignoring late event for closed inbound stream %s", stream_id
+            )
+            raise QUICStreamError(f"Closed inbound stream {stream_id}")
+
+        if stream_id not in self._quic._streams:
+            # Late event for an already-discarded stream (see
+            # _handle_stream_data_batch): aioquic no longer tracks it, so any
+            # wrapper is a ghost whose writes fail with "Cannot send data on
+            # unknown peer-initiated stream".
+            logger.debug(
+                "Ignoring late event for discarded inbound stream %s "
+                "(aioquic no longer tracks it, %d streams left)",
+                stream_id,
+                len(self._quic._streams),
+            )
+            raise QUICStreamError(f"Discarded inbound stream {stream_id}")
+
         async with self._stream_lock:
             # Double-check stream doesn't exist
             existing_stream = self._streams.get(stream_id)
@@ -1546,6 +1620,23 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 f"Received data for unknown outbound stream {stream_id}"
             )
 
+        if stream_id in self._recently_closed_streams:
+            # Late event for a stream we already handled and closed.
+            logger.debug(
+                "Ignoring late event for closed inbound stream %s", stream_id
+            )
+            raise QUICStreamError(f"Closed inbound stream {stream_id}")
+
+        if stream_id not in self._quic._streams:
+            # Late event for an already-discarded stream (see
+            # _handle_stream_data_batch): aioquic no longer tracks it.
+            logger.debug(
+                "Ignoring late event for discarded inbound stream %s "
+                "(aioquic no longer tracks it)",
+                stream_id,
+            )
+            raise QUICStreamError(f"Discarded inbound stream {stream_id}")
+
         # Create new inbound stream
         return await self._create_inbound_stream(stream_id)
 
@@ -1600,6 +1691,26 @@ class QUICConnection(IRawConnection, IMuxedConn):
             if timer <= now:
                 self._quic.handle_timer(now=now)
 
+        # Send keep-alive PING if the connection has been idle too long.
+        self._maybe_send_keepalive()
+
+    def _maybe_send_keepalive(self) -> None:
+        """Send a PING frame if the connection is idle past the keep-alive interval.
+
+        aioquic has no built-in keep-alive; quic-go (used by kubo) sends a PING
+        every KeepAlivePeriod (15 s) to keep idle connections open past the
+        negotiated idle timeout. We mirror that here.
+        """
+        interval = self._keepalive_interval
+        if interval <= 0.0 or self._closed or not self._handshake_completed:
+            return
+        now = time.time()
+        if now - self._last_transmit_time >= interval:
+            self._quic.send_ping(self._ping_uid_counter)
+            self._ping_uid_counter += 1
+            self._last_transmit_time = now
+            self._stats["keepalive_pings_sent"] += 1
+
     # Network transmission
 
     async def _transmit(self) -> None:
@@ -1626,6 +1737,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
             if packet_count > 0:
                 self._stats["packets_sent"] += packet_count
                 self._stats["bytes_sent"] += total_bytes
+                self._last_transmit_time = current_time
 
         except Exception as e:
             logger.error(f"Transmission error: {e}")
