@@ -932,19 +932,58 @@ class BitswapClient(INotifee):
             except Exception:
                 continue
 
-        # If stream is writable, write responses immediately on this existing stream
-        # (0 new streams!).
+        # Send responses on a NEW stream to the requester (matches go-bitswap
+        # server behavior: SendMessage opens a fresh stream, and the requester
+        # only reads messages on streams WE open). Inline-on-the-request-
+        # stream responses are invisible to go-bitswap clients.
         if blocks_to_send_v100 or blocks_to_send_v110 or presences_to_send:
             try:
-                await self._send_wantlist_responses_inline(
-                    stream,
+                await self._send_wantlist_responses_on_new_stream(
                     peer_id,
                     blocks_to_send_v100,
                     blocks_to_send_v110,
                     presences_to_send,
                 )
             except Exception as e:
-                logger.debug(f"Failed to respond inline on stream: {e}")
+                logger.debug(f"Failed to respond on new stream: {e}")
+                try:
+                    await self._send_wantlist_responses_inline(
+                        stream,
+                        peer_id,
+                        blocks_to_send_v100,
+                        blocks_to_send_v110,
+                        presences_to_send,
+                    )
+                except Exception as e2:
+                    logger.debug(f"Failed to respond to wantlist: {e2}")
+
+    async def _send_wantlist_responses_on_new_stream(
+        self,
+        peer_id: PeerID,
+        blocks_to_send_v100: list[bytes],
+        blocks_to_send_v110: list[tuple[bytes, bytes]],
+        presences_to_send: list[tuple[CIDObject, bool]],
+    ) -> None:
+        """Respond by opening a NEW stream to the requester (go-bitswap style)."""
+        protocol = self._peer_protocols.get(peer_id, BITSWAP_PROTOCOL_V100)
+        stream = await self.host.new_stream(peer_id, [protocol])
+        try:
+            if blocks_to_send_v100:
+                await self._send_blocks_in_batches_v100(
+                    blocks_to_send_v100, peer_id, stream
+                )
+            if blocks_to_send_v110:
+                await self._send_blocks_in_batches_v110(
+                    blocks_to_send_v110, peer_id, stream
+                )
+            if presences_to_send:
+                presence_msg = create_message(block_presences=presences_to_send)
+                await self._write_message(stream, presence_msg)
+        finally:
+            try:
+                await stream.close()
+            except Exception:
+                pass
 
     async def _send_wantlist_responses_inline(
         self,

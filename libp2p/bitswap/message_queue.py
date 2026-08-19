@@ -83,13 +83,14 @@ class BitswapMessageQueue:
             return
         self._started = False
         self._cancel_scope.cancel()
-        async with self._lock:
-            if self._stream is not None:
-                try:
-                    await self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
+        with trio.move_on_after(2.0):
+            async with self._lock:
+                if self._stream is not None:
+                    try:
+                        await self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
 
     def add_wants(
         self,

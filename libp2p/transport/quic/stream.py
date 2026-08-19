@@ -335,9 +335,9 @@ class QUICStream(IMuxedStream):
         except ValueError as e:
             if "unknown peer-initiated stream" in str(e):
                 raise QUICStreamClosedError(
-                    f"Stream {self.stream_id} was already closed in QUIC layer"
+                    f"Stream {self._stream_id} was already closed in QUIC layer"
                 ) from e
-            logger.error(f"Error writing to stream {self.stream_id}: {e}")
+            logger.error(f"Error writing to stream {self._stream_id}: {e}")
             await self._handle_stream_error(e)
             raise
         except Exception as e:

@@ -193,7 +193,11 @@ class BitswapSession:
 
         start_time = time.time()
         retry_interval = 1.0
-        last_rebroadcast = 0.0
+        # Fire the first WANT-HAVE broadcast immediately (go-libp2p
+        # semantics): waiting a full REBROADCAST_INTERVAL before the first
+        # broadcast leaves connected peers un-asked and stalls fetches
+        # when the DHT finds no provider.
+        last_rebroadcast = -REBROADCAST_INTERVAL
         requested_from: set[PeerID] = set()
         # Track peers we've sent WANT_BLOCK to (for parallel racing)
         block_requested_from: set[PeerID] = set()
@@ -402,7 +406,11 @@ class BitswapSession:
 
             start_time = time.time()
             retry_interval = 1.0
-            last_rebroadcast = 0.0
+            # Fire the first WANT-HAVE broadcast immediately (go-libp2p
+            # semantics): waiting a full REBROADCAST_INTERVAL before the first
+            # broadcast leaves connected peers un-asked and stalls fetches
+            # when the DHT finds no provider.
+            last_rebroadcast = -REBROADCAST_INTERVAL
             requested_from: dict[CIDObject, set[PeerID]] = {cid: set() for cid in batch}
             block_requested_from: dict[CIDObject, set[PeerID]] = {
                 cid: set() for cid in batch
