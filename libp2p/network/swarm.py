@@ -78,6 +78,7 @@ from libp2p.utils.address_validation import (
     has_public_ipv6,
     is_public_ipv6_address,
     is_relay_address,
+    is_routable_address,
 )
 from libp2p.utils.multiaddr_utils import (
     extract_ip_from_multiaddr,
@@ -471,6 +472,22 @@ class Swarm(Service, INetworkService):
         """
         return len(self.get_connections())
 
+    def get_connected_peer_count(self) -> int:
+        """
+        Get the number of unique peers with at least one open connection.
+
+        Unlike :meth:`get_total_connections` (which counts raw connections
+        and over-counts multihomed peers holding one QUIC + one TCP conn),
+        this reports what operators see as "connected peers".  The
+        auto-connector drives the watermark targets off this number so a
+        target of 400 really means 400 distinct peers.
+        """
+        count = 0
+        for conns in self.connections.values():
+            if any(not getattr(c, "is_closed", False) for c in conns):
+                count += 1
+        return count
+
     def get_connections_map(self) -> dict[ID, list[INetConn]]:
         """
         Get all connections map (like JS getConnectionsMap).
@@ -759,16 +776,22 @@ class Swarm(Service, INetworkService):
                     f"All addresses for peer {peer_id} blocked by connection gate"
                 )
 
-            # Filter out loopback addresses if public addresses are available
-            # This prevents the node from dialing itself when DHT peers
-            # advertise localhost
-            public_addrs = [
-                a
-                for a in allowed_addrs
-                if "/ip4/127." not in str(a) and "/ip6/::1" not in str(a)
-            ]
+            # Filter out non-routable addresses (loopback 127.x/::1,
+            # Docker-internal 172.x/10.x, LAN 192.168.x, link-local, …)
+            # when the peer also advertises public or DNS addresses.  This
+            # prevents the node from dialing itself when peers advertise
+            # loopback/Docker addresses: the packets land on our own
+            # listener and every attempt fails with "Peer ID mismatch",
+            # churning the auto-connector.
+            public_addrs = [a for a in allowed_addrs if is_routable_address(a)]
             if public_addrs:
                 allowed_addrs = public_addrs
+                # Prefer the routable subset on the dial queue: junk
+                # addresses (if any slipped past the filter) are tried
+                # last, only after every public attempt failed.
+                allowed_addrs.sort(
+                    key=lambda a: not is_routable_address(a)
+                )
 
             # Skip relay (p2p-circuit) addresses: this node has no relay
             # transport, so these can never be dialed (mirrors go-libp2p,
@@ -2726,7 +2749,7 @@ class Swarm(Service, INetworkService):
             return
         self._last_auto_connect_trigger = now
         try:
-            self.manager.run_task(self.auto_connector.maybe_connect)
+            self.manager.run_task(self.auto_connector.maybe_connect, "disconnect")
         except Exception:
             # No running manager — auto-connector is not started either.
             logger.debug("Failed to schedule auto-connect", exc_info=True)
@@ -2983,10 +3006,14 @@ class Swarm(Service, INetworkService):
 
     async def notify_disconnected(self, conn: INetConn) -> None:
         # Record the disconnect so the auto-connector backs off from
-        # immediately re-dialing this peer (avoids reconnect loops).
+        # immediately re-dialing this peer (avoids reconnect loops) and can
+        # quarantine peers that remotely evict us quickly (retention-aware
+        # dialing).
         try:
             peer_id = conn.muxed_conn.peer_id
-            self.auto_connector.record_disconnect(peer_id)
+            created = getattr(conn, "_created_at", None)
+            lifespan = time.time() - created if created else None
+            self.auto_connector.record_disconnect(peer_id, lifespan=lifespan)
         except Exception:
             pass
         # Replenish connections promptly when disconnects drop us below the
