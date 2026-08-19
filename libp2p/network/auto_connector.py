@@ -417,8 +417,11 @@ class AutoConnector:
             # Shuffle to randomize connection order
             random.shuffle(candidates)
 
-            # Concurrency limiter and dial batch sizing (matches go-libp2p: 16-32)
-            CONN_MGR_BATCH_SIZE = 32 if needed > 32 else 16
+            # Concurrency limiter and dial batch sizing.
+            # 128 concurrent dials keeps cycle time ~11s (1.28s dispatch + 10s
+            # dial timeout) giving ~11 dials/sec — enough to outpace the
+            # ~2.8/s eviction rate from remote connmgr trimming.
+            CONN_MGR_BATCH_SIZE = 128 if needed > 128 else 64
             dial_limiter = trio.CapacityLimiter(CONN_MGR_BATCH_SIZE)
             max_dials_per_cycle = CONN_MGR_BATCH_SIZE
 
@@ -499,8 +502,10 @@ class AutoConnector:
 
                         dial_nursery.start_soon(_dial_candidate, peer_id)
                         dialed += 1
-                        # 50ms stagger between dispatches to eliminate CPU spikes
-                        await trio.sleep(0.05)
+                        # 10ms stagger between dispatches — prevents CPU
+                        # spikes while keeping dispatch overhead under 1.3s
+                        # for 128 dials (0.01 × 128 = 1.28s)
+                        await trio.sleep(0.01)
             except Exception as e:
                 logger.error(f"Error in auto_connect dial nursery: {e}")
 
