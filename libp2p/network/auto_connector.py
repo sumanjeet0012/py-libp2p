@@ -421,7 +421,7 @@ class AutoConnector:
             # 128 concurrent dials keeps cycle time ~11s (1.28s dispatch + 10s
             # dial timeout) giving ~11 dials/sec — enough to outpace the
             # ~2.8/s eviction rate from remote connmgr trimming.
-            CONN_MGR_BATCH_SIZE = 128 if needed > 128 else 64
+            CONN_MGR_BATCH_SIZE = 16 if needed > 16 else 8
             dial_limiter = trio.CapacityLimiter(CONN_MGR_BATCH_SIZE)
             max_dials_per_cycle = CONN_MGR_BATCH_SIZE
 
