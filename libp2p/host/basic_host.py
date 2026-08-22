@@ -1405,6 +1405,12 @@ class BasicHost(IHost):
             await net_stream.reset()
             return
         net_stream.set_protocol(protocol)
+        logger.info(
+            "INBOUND_STREAM: peer=%s protocol=%s transport=%s",
+            net_stream.muxed_conn.peer_id,
+            protocol,
+            getattr(net_stream.muxed_conn, "_transport_type", "unknown"),
+        )
         if handler is None:
             logger.debug(
                 "no handler for protocol %s, closing stream from peer %s",
