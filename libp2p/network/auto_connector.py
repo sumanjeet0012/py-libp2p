@@ -186,10 +186,18 @@ class AutoConnector:
         self._quick_deaths: dict[ID, int] = {}
         self._quarantine_until: dict[ID, float] = {}
         self._quarantine_count: dict[ID, int] = {}
+        self._last_quarantine_at: dict[ID, float] = {}
         self._quick_death_threshold = 60.0  # lifespan below this = eviction
-        self._quick_death_limit = 2  # evictions before quarantining
-        self._quarantine_base = 1200.0  # 20 min, doubles per offense
-        self._quarantine_max = 14400.0  # cap at 4 hours
+        self._quick_death_limit = 3  # evictions before quarantining
+        self._quarantine_base = 90.0  # 90 s, doubles per offense
+        self._quarantine_max = 1800.0  # cap at 30 minutes
+        # Forgive history: offenses older than this are wiped when a peer
+        # re-offends, so an unlucky streak hours ago does not escalate
+        # forever (prevents permanent candidate-pool exhaustion).
+        self._offense_decay_seconds = 900.0
+        # Bound the quarantined set: with heavy churn the set otherwise grows
+        # until most candidates are blocked and dialing starves.
+        self._quarantine_max_entries = 800
         # Critical poll interval: when the connection count falls below
         # min_connections we poll at _critical_check_interval so the node
         # recovers steadily without overwhelming the CPU (Bug 15).
@@ -672,6 +680,7 @@ class AutoConnector:
                 self._quarantine_until.pop(pid, None)
                 self._quarantine_count.pop(pid, None)
                 self._quick_deaths.pop(pid, None)
+                self._last_quarantine_at.pop(pid, None)
 
         if self._dial_history:
             stale_history = [
@@ -908,12 +917,23 @@ class AutoConnector:
         if count < self._quick_death_limit:
             return
 
+        now = time.time()
+        # Offense decay: a long gap since the last quarantine means the
+        # earlier streak is stale — start over at offense 1 instead of
+        # escalating on months-old history.
+        if now - self._last_quarantine_at.get(peer_id, 0.0) > (
+            self._offense_decay_seconds
+        ):
+            self._quarantine_count[peer_id] = 0
+
         offense = self._quarantine_count.get(peer_id, 0) + 1
         self._quarantine_count[peer_id] = offense
+        self._last_quarantine_at[peer_id] = now
         duration = min(
             self._quarantine_base * (2 ** (offense - 1)), self._quarantine_max
         )
-        self._quarantine_until[peer_id] = time.time() + duration
+        self._enforce_quarantine_cap()
+        self._quarantine_until[peer_id] = now + duration
         logger.info(
             "QUARANTINE: peer %s evicted %s quick conns (last lifespan %.0fs, "
             "offense %d); not dialing for %.0fs",
@@ -922,6 +942,31 @@ class AutoConnector:
             lifespan,
             offense,
             duration,
+        )
+
+    def _enforce_quarantine_cap(self) -> None:
+        """
+        Bound the quarantine set so candidate exhaustion cannot starve dialing.
+
+        When more than ``_quarantine_max_entries`` peers are quarantined,
+        release the bans that expire soonest — they are nearly dialable
+        anyway, and a bounded set keeps the candidate pool alive under
+        heavy churn.
+        """
+        excess = len(self._quarantine_until) - self._quarantine_max_entries
+        if excess <= 0:
+            return
+        soonest = sorted(self._quarantine_until.items(), key=lambda kv: kv[1])
+        for pid, _until in soonest[:excess]:
+            self._quarantine_until.pop(pid, None)
+            self._quarantine_count.pop(pid, None)
+            self._quick_deaths.pop(pid, None)
+            self._last_quarantine_at.pop(pid, None)
+        logger.info(
+            "QUARANTINE: set exceeded %d entries; released %d soonest-expiring "
+            "bans to keep the candidate pool dialable",
+            self._quarantine_max_entries,
+            excess,
         )
 
     def record_failed_connection(self, peer_id: ID) -> None:
@@ -961,5 +1006,6 @@ class AutoConnector:
         self._quick_deaths.clear()
         self._quarantine_until.clear()
         self._quarantine_count.clear()
+        self._last_quarantine_at.clear()
         self._dial_history.clear()
         self._ever_dialed.clear()
