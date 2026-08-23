@@ -789,9 +789,7 @@ class Swarm(Service, INetworkService):
                 # Prefer the routable subset on the dial queue: junk
                 # addresses (if any slipped past the filter) are tried
                 # last, only after every public attempt failed.
-                allowed_addrs.sort(
-                    key=lambda a: not is_routable_address(a)
-                )
+                allowed_addrs.sort(key=lambda a: not is_routable_address(a))
 
             # Skip relay (p2p-circuit) addresses: this node has no relay
             # transport, so these can never be dialed (mirrors go-libp2p,
@@ -1880,9 +1878,11 @@ class Swarm(Service, INetworkService):
         try:
             self._inbound_limiter.acquire_nowait()
         except trio.WouldBlock:
-            logger.debug(
-                "Inbound connection cap (%d) reached; rejecting new inbound connection",
+            logger.warning(
+                "[INBOUND_LIMITER_DENY] Inbound connection cap (%d) reached; "
+                "rejecting new inbound connection from %s",
                 int(self._inbound_limiter.total_tokens),
+                maddr,
             )
             transport_event = TransportEvent()
             transport_event.conn_in = True
@@ -1896,20 +1896,53 @@ class Swarm(Service, INetworkService):
                 pass
             return
 
+        registered_conn: SwarmConn | None = None
         try:
-            await self._do_handle_inbound_connection(
+            registered_conn = await self._do_handle_inbound_connection(
                 read_write_closer, maddr, failure_event
             )
         finally:
-            self._inbound_limiter.release()
+            # Release the inbound slot here only when the connection was NOT
+            # successfully registered.  For registered connections the slot is
+            # held for the lifetime of the connection and released below as
+            # soon as ``SwarmConn.event_closed`` fires.  Previously the token
+            # was always released when this handler returned, but a registered
+            # connection keeps its handler alive until swarm shutdown, so
+            # every inbound connection that ever closed leaked its slot
+            # permanently.  After ~250 cumulative inbound connections the
+            # limiter saturated and every new inbound connection was rejected
+            # post-handshake (symptom: peer "connects" then drops a few
+            # seconds later).
+            if registered_conn is None:
+                self._inbound_limiter.release()
+
+        if registered_conn is not None:
+            try:
+                await registered_conn.event_closed.wait()
+            finally:
+                # The connection closed (or the handler was cancelled during
+                # shutdown) — give the slot back so future inbound
+                # connections can be admitted.
+                self._inbound_limiter.release()
+            # Intentional barrier: keep handler alive so the connection
+            # handler task outlives the connection, mirroring the previous
+            # behaviour of parking on the swarm's finished event.
+            await self.manager.wait_finished()
 
     async def _do_handle_inbound_connection(
         self,
         read_write_closer: ReadWriteCloser,
         maddr: Multiaddr,
         failure_event: "SwarmEvent",
-    ) -> None:
-        """Inner inbound-connection handler, called after acquiring the inbound slot."""
+    ) -> "SwarmConn | None":
+        """
+        Inner inbound-connection handler, called after acquiring the inbound slot.
+
+        Returns the registered :class:`SwarmConn` when the connection was
+        successfully admitted (the caller then holds its inbound slot for the
+        connection's lifetime).  Returns None on every rejection/failure path
+        (the caller releases the slot immediately).
+        """
         # Enforce connection gate on inbound connections.
         remote_maddr = self._build_remote_multiaddr(read_write_closer)
         logger.debug(
@@ -1918,8 +1951,9 @@ class Swarm(Service, INetworkService):
 
         if remote_maddr is not None:
             if not await self.connection_gate.is_allowed(remote_maddr):
-                logger.debug(
-                    "Inbound connection from %s denied by connection gate",
+                logger.warning(
+                    "[INBOUND_GATE_DENY] Inbound connection from %s denied by "
+                    "connection gate",
                     remote_maddr,
                 )
                 try:
@@ -1942,12 +1976,21 @@ class Swarm(Service, INetworkService):
         # WebTransport), skip the security + muxer upgrade entirely.
         # Detection is via the IMuxedConn interface, not a class check.
         if isinstance(read_write_closer, IMuxedConn):
+            registered_conn: SwarmConn | None = None
             try:
                 muxed_conn = cast(IMuxedConn, read_write_closer)
-                await self.add_conn(muxed_conn, direction="inbound")
+                logger.info(
+                    "[INBOUND_MUXED] Registering pre-multiplexed inbound conn "
+                    "peer=%s from %s",
+                    getattr(muxed_conn, "peer_id", "unknown"),
+                    maddr,
+                )
+                swarm_conn = await self.add_conn(muxed_conn, direction="inbound")
+                registered_conn = swarm_conn
                 peer_id = getattr(muxed_conn, "peer_id", None)
-                logger.debug(
-                    "successfully opened pre-multiplexed inbound connection (peer=%s)",
+                logger.info(
+                    "[INBOUND_MUXED_OK] successfully opened pre-multiplexed "
+                    "inbound connection (peer=%s)",
                     peer_id,
                 )
                 muxer_event = MuxerEvent()
@@ -1955,19 +1998,26 @@ class Swarm(Service, INetworkService):
                 muxer_event.muxer = transport_label(maddr=maddr)
                 muxer_event.direction = "inbound"
                 muxer_event.success = True
-                muxer_event.peer_id = (
-                    str(peer_id) if peer_id is not None else None
-                )
+                muxer_event.peer_id = str(peer_id) if peer_id is not None else None
                 muxer_event.local_maddr = str(maddr)
                 muxer_event.protocol_id = getattr(
                     self.upgrader.muxer_multistream, "last_selected_protocol", None
                 )
                 self._event_bus.emit(muxer_event)
-                # Intentional barrier: keep handler alive so the connection
-                # stays open for the duration of the swarm's lifetime.
-                await self.manager.wait_finished()
-            except Exception:
-                await read_write_closer.close()
+            except Exception as _inbound_exc:
+                _peer_id_str = str(getattr(read_write_closer, "peer_id", "unknown"))
+                logger.warning(
+                    "[INBOUND_QUIC_FAIL] add_conn failed for inbound QUIC peer %s "
+                    "from %s: %r",
+                    _peer_id_str,
+                    maddr,
+                    _inbound_exc,
+                    exc_info=True,
+                )
+                try:
+                    await read_write_closer.close()
+                except Exception:
+                    pass
                 # Emit event for incoming conn failure
                 failure_event.conn_incoming_error = True
                 self._event_bus.emit(failure_event)
@@ -1977,16 +2027,16 @@ class Swarm(Service, INetworkService):
                 transport_event.success = False
                 transport_event.local_maddr = str(maddr)
                 self._event_bus.emit(transport_event)
-            return
+            return registered_conn
 
         # Standard upgrade path (TCP, WebSocket): wrap in RawConnection then
         # run the security + muxer upgrade pipeline.
         raw_conn = None
+        registered_conn: SwarmConn | None = None
         try:
             raw_conn = RawConnection(read_write_closer, False)
-            await self.upgrade_inbound_raw_conn(raw_conn, maddr)
-            # Intentional barrier: keep handler alive.
-            await self.manager.wait_finished()
+            inbound_swarm_conn = await self.upgrade_inbound_raw_conn(raw_conn, maddr)
+            registered_conn = inbound_swarm_conn
         except Exception as e:
             logger.debug("Error handling incoming connection: %s", e)
             try:
@@ -2005,16 +2055,18 @@ class Swarm(Service, INetworkService):
                     self._event_bus.emit(transport_event)
             except Exception:
                 pass
+        return registered_conn
 
     async def upgrade_inbound_raw_conn(
         self, raw_conn: IRawConnection, maddr: Multiaddr
-    ) -> IMuxedConn:
+    ) -> "SwarmConn":
         """
         Secure the inbound raw connection and upgrade it to a multiplexed connection.
 
         :param raw_conn: the inbound raw connection to upgrade
         :raises SwarmException: raised when security or muxer upgrade fails
-        :return: network connection with security and multiplexing established
+        :return: the registered SwarmConn with security and multiplexing
+            established
         """
         # Fast-fail check on the global connection limit: avoid doing the
         # expensive security+muxer handshake when we are already at capacity.
@@ -2264,10 +2316,10 @@ class Swarm(Service, INetworkService):
                 # Let add_conn perform final guard if needed
                 pass
 
-        await self.add_conn(muxed_conn, direction="inbound")
+        inbound_swarm_conn = await self.add_conn(muxed_conn, direction="inbound")
         logger.debug("successfully opened connection to peer %s", peer_id)
 
-        return muxed_conn
+        return inbound_swarm_conn
 
     async def close(self) -> None:
         """
@@ -2680,9 +2732,7 @@ class Swarm(Service, INetworkService):
             listen_conn_event.connection_type = conn_type_name
             actual_addrs = getattr(swarm_conn, "_actual_transport_addresses", None)
             if actual_addrs:
-                listen_conn_event.remote_maddr = ",".join(
-                    str(a) for a in actual_addrs
-                )
+                listen_conn_event.remote_maddr = ",".join(str(a) for a in actual_addrs)
             else:
                 try:
                     remote = muxed_conn.get_remote_address()

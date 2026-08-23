@@ -1104,8 +1104,9 @@ class QUICListener(IListener):
                         if peer_id:
                             connection.peer_id = peer_id
                         logger.info(
-                            f"Security verification successful for "
-                            f"{destination_connection_id.hex()}"
+                            f"[QUIC_SEC_OK] Security verification successful for "
+                            f"{destination_connection_id.hex()} "
+                            f"from {addr} peer={peer_id}"
                         )
                     except Exception as e:
                         logger.error(
@@ -1133,7 +1134,10 @@ class QUICListener(IListener):
                             await self._handler(connection)
 
                 except Exception as e:
-                    logger.error(f"Error in user callback: {e}")
+                    logger.error(
+                        f"[QUIC_HANDLER_ERROR] Error in user callback for peer "
+                        f"{getattr(connection, 'peer_id', 'unknown')}: {e}"
+                    )
 
                 self._stats["connections_accepted"] += 1
                 logger.info(

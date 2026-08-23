@@ -28,7 +28,6 @@ import trio
 import libp2p
 from libp2p.abc import (
     IHost,
-    IMuxedConn,
     INetConn,
     INetStream,
     INetwork,
@@ -1463,7 +1462,7 @@ class BasicHost(IHost):
 
     async def upgrade_inbound_connection(
         self, raw_conn: IRawConnection, maddr: multiaddr.Multiaddr
-    ) -> IMuxedConn:
+    ) -> INetConn:
         """
         Upgrade a raw inbound connection using the underlying network.
 
