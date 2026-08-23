@@ -426,10 +426,11 @@ class AutoConnector:
             random.shuffle(candidates)
 
             # Concurrency limiter and dial batch sizing.
-            # 128 concurrent dials keeps cycle time ~11s (1.28s dispatch + 10s
-            # dial timeout) giving ~11 dials/sec — enough to outpace the
-            # ~2.8/s eviction rate from remote connmgr trimming.
-            CONN_MGR_BATCH_SIZE = 16 if needed > 16 else 8
+            # 32 concurrent dials per ~11s cycle (~2.9 dials/sec) so
+            # replenishment outpaces remote connmgr eviction waves instead of
+            # merely matching them. The limiter bounds concurrent sockets;
+            # the cycle trigger interval bounds total dial rate.
+            CONN_MGR_BATCH_SIZE = 32 if needed > 16 else 8
             dial_limiter = trio.CapacityLimiter(CONN_MGR_BATCH_SIZE)
             max_dials_per_cycle = CONN_MGR_BATCH_SIZE
 
