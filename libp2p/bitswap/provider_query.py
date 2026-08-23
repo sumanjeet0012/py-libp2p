@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING
 import trio
 
 from libp2p.peer.id import ID as PeerID
+from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
 
-from .cid import CIDInput, cid_to_bytes, format_cid_for_display
+from .cid import CIDInput, cid_to_bytes, format_cid_for_display, parse_cid
 from .events import BitswapEvent
 
 if TYPE_CHECKING:
@@ -348,15 +349,50 @@ class ProviderQueryManager:
             query_start = time.monotonic()
             providers: list[PeerID] = []
 
+            # Normalize to the same key form used by KadDHT.provide():
+            # the bare multihash (_encode_key strips CID prefix bytes).
+            # Querying with full CID bytes yields a DIFFERENT DHT key, so
+            # lookups never see records that were announced correctly.
+            try:
+                cid_obj_ = cid if hasattr(cid, "multihash") else parse_cid(cid)
+                dht_key = getattr(cid_obj_, "multihash", cid_bytes)
+            except Exception:
+                dht_key = cid_bytes
+
             try:
                 with trio.fail_after(timeout):
                     # Perform a network DHT provider lookup (not a local-store read)
                     provider_infos = await self.dht.provider_store.find_providers(
-                        cid_bytes, self.max_providers
+                        dht_key, self.max_providers
                     )
 
                     # Extract peer IDs from PeerInfo objects
                     providers = [info.peer_id for info in provider_infos]
+
+                    # Persist discovered addresses into the host peerstore so
+                    # the session can dial providers it has never talked to.
+                    # Without this, _dial_provider() sees an empty peerstore,
+                    # skips the dial, and the fetch falls back to broadcast
+                    # which starves when no peers are connected yet.
+                    peerstore = getattr(
+                        getattr(self.dht, "host", None), "peerstore", None
+                    )
+                    if peerstore is not None:
+                        for info in provider_infos:
+                            addrs = list(getattr(info, "addrs", []) or [])
+                            if addrs:
+                                try:
+                                    peerstore.add_addrs(
+                                        info.peer_id,
+                                        addrs,
+                                        PERMANENT_ADDR_TTL,
+                                    )
+                                except Exception as e:
+                                    logger.debug(
+                                        "Failed storing addrs for provider %s: %s",
+                                        info.peer_id,
+                                        e,
+                                    )
 
                     # Limit to max_providers
                     if len(providers) > self.max_providers:
