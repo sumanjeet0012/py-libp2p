@@ -612,18 +612,16 @@ class QUICConnection(IRawConnection, IMuxedConn):
                     except Exception:
                         pass
 
-                # On first maintenance cycle, set M_MMAP_THRESHOLD_ to 0 to
-                # force ALL heap allocations through mmap. When mmap'd memory
-                # is freed via munmap(), the OS reclaims it immediately rather
-                # than glibc holding it in arenas. This is critical for
-                # preventing RSS growth from OpenSSL's per-operation allocations
-                # (encrypt/decrypt cycles for each QUIC stream).
+                # On first maintenance cycle, set M_MMAP_THRESHOLD_ to 8KB so
+                # allocations >=8KB use mmap (returned to OS via munmap).
+                # Smaller allocations stay on heap to avoid 4KB waste from
+                # mmap's minimum page size.
                 if maintenance_count == 1:
                     try:
                         import ctypes
                         libc = ctypes.CDLL("libc.so.6")
-                        # M_MMAP_THRESHOLD_ = -3, value 0 = always use mmap
-                        libc.mallopt(-3, 0)
+                        # M_MMAP_THRESHOLD_ = -3, value 8192 = use mmap for >=8KB
+                        libc.mallopt(-3, 8192)
                     except Exception:
                         pass
 
