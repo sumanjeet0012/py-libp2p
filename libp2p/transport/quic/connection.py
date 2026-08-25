@@ -1871,19 +1871,69 @@ class QUICConnection(IRawConnection, IMuxedConn):
             except Exception as e:
                 logger.debug(f"Error notifying parent of connection termination: {e}")
 
-            # Clear internal aioquic event queues and stream maps to free memory
-            # immediately.
+            # Aggressively release ALL C-level state held by the aioquic
+            # QuicConnection to prevent unbounded memory growth.
+            # Without this, OpenSSL key schedules, recovery buffers, crypto
+            # streams, and TLS session state remain allocated until Python GC
+            # collects the object — which may never happen if any reference
+            # lingers in the listener/registry tracking dicts.
             if self._quic is not None:
-                if hasattr(self._quic, "_events"):
-                    try:
-                        self._quic._events.clear()
-                    except Exception:
-                        pass
-                if hasattr(self._quic, "_streams"):
-                    try:
-                        self._quic._streams.clear()
-                    except Exception:
-                        pass
+                # Null out TLS context — frees OpenSSL key schedule, peer
+                # certificate chains, EC private keys, and receive buffers.
+                try:
+                    self._quic.tls = None
+                except Exception:
+                    pass
+                # Null out loss/recovery state — frees packet number space,
+                # ACK tracking, congestion controller, and pacer buffers.
+                try:
+                    self._quic._loss = None
+                except Exception:
+                    pass
+                # Clear crypto stream state — these hold bytearrays for
+                # handshake data that are never freed otherwise.
+                for attr in (
+                    "_crypto_streams",
+                    "_crypto_buffers",
+                    "_cryptos",
+                    "_cryptos_initial",
+                ):
+                    if hasattr(self._quic, attr):
+                        try:
+                            val = getattr(self._quic, attr)
+                            if hasattr(val, "clear"):
+                                val.clear()
+                            elif hasattr(val, "values"):
+                                for v in val.values():
+                                    if hasattr(v, "clear"):
+                                        v.clear()
+                        except Exception:
+                            pass
+                # Clear datagram and network path state
+                for attr in (
+                    "_events",
+                    "_streams",
+                    "_streams_finished",
+                    "_datagrams_pending",
+                    "_network_paths",
+                    "_host_cids",
+                    "_peer_cid_available",
+                ):
+                    if hasattr(self._quic, attr):
+                        try:
+                            val = getattr(self._quic, attr)
+                            if hasattr(val, "clear"):
+                                val.clear()
+                        except Exception:
+                            pass
+                # Null the quic_logger to prevent it holding buffered log data
+                try:
+                    self._quic._quic_logger = None
+                except Exception:
+                    pass
+                # Release the aioquic QuicConnection object entirely so
+                # Python GC can reclaim it immediately.
+                self._quic = None
 
             logger.debug(f"QUIC connection to {self._remote_peer_id} closed")
 
@@ -1932,9 +1982,15 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 await self._cleanup_by_connection_id(self._current_connection_id)
                 return
 
+            host_cid_hex = ""
+            if self._quic is not None and hasattr(self._quic, "host_cid"):
+                try:
+                    host_cid_hex = self._quic.host_cid.hex()
+                except Exception:
+                    pass
             logger.warning(
                 "Could not notify parent of connection termination - no"
-                f" parent reference found for conn host {self._quic.host_cid.hex()}"
+                f" parent reference found for conn host {host_cid_hex}"
             )
 
         except Exception as e:
