@@ -582,8 +582,11 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
     async def _periodic_maintenance(self) -> None:
         """Perform periodic connection maintenance."""
+        maintenance_count = 0
         try:
             while not self._closed:
+                maintenance_count += 1
+
                 # Update connection statistics
                 self._update_stats()
 
@@ -596,6 +599,18 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
                 # Clean cache periodically
                 await self._cleanup_cache()
+
+                # Periodically force glibc to release free memory back to the
+                # OS. Without this, malloc fragmentation from OpenSSL
+                # encrypt/decrypt cycles causes RSS to grow indefinitely even
+                # though logical objects are properly freed.
+                if maintenance_count % 5 == 0:
+                    try:
+                        import ctypes
+                        libc = ctypes.CDLL("libc.so.6")
+                        libc.malloc_trim(0)
+                    except Exception:
+                        pass
 
                 # Sleep for maintenance interval
                 await trio.sleep(30.0)  # 30 seconds
@@ -1053,6 +1068,20 @@ class QUICConnection(IRawConnection, IMuxedConn):
         result = False  # Default to False if no events processed
 
         try:
+            # Periodically trim aioquic's _streams_finished set which grows
+            # unboundedly (one int per completed stream, never cleaned by
+            # aioquic itself). With400 connections doing 1 stream/15s,
+            # this adds ~96k entries/hour (~2.7 MiB Python int objects).
+            if self._quic is not None:
+                finished = getattr(self._quic, "_streams_finished", None)
+                if finished is not None and len(finished) > 10000:
+                    # Keep only the most recent half (higher stream IDs =
+                    # more recent, since IDs are monotonically increasing).
+                    threshold = max(finished) - len(finished) // 2
+                    finished_copy = {sid for sid in finished if sid > threshold}
+                    finished.clear()
+                    finished.update(finished_copy)
+
             current_time = time.time()
             events_processed = 0
 

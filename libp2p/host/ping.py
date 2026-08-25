@@ -212,7 +212,18 @@ class PingService:
 
         async with self._lock:
             stream = self._outbound_streams.get(peer_id)
-            if stream is None or (hasattr(stream, "is_closed") and stream.is_closed()):  # type: ignore[attr-defined]
+            # Check if cached stream is still usable. A stream may be closed
+            # (connection dropped) or in reset state (protocol error). In both
+            # cases we must create a fresh stream.
+            needs_new = stream is None
+            if stream is not None:
+                if hasattr(stream, "is_closed") and stream.is_closed():  # type: ignore[attr-defined]
+                    needs_new = True
+                elif hasattr(stream, "_state"):
+                    from libp2p.network.stream.exceptions import StreamState
+                    if getattr(stream._state, "value", None) == "RESET":
+                        needs_new = True
+            if needs_new:
                 stream = await self._host.new_stream(peer_id, [ID])
                 self._outbound_streams[peer_id] = stream
 
@@ -224,16 +235,13 @@ class PingService:
                 rtt = await _ping(stream, cancel_scope=cancel_scope)
                 rtts.append(rtt)
                 yield rtt
-            # Spec: "The dialing peer SHOULD close the write operation of the
-            # stream after sending the last payload."
-            if hasattr(stream, "close_write"):
-                await stream.close_write()  # type: ignore[attr-defined]
-            try:
-                await stream.close()
-            except Exception:
-                pass
-            async with self._lock:
-                self._outbound_streams.pop(peer_id, None)
+            # Keep the stream open for reuse across ping cycles.
+            # Closing and reopening a QUIC stream per ping causes massive
+            # C-level memory fragmentation (OpenSSL encrypt/decrypt buffers,
+            # glibc malloc pools) that manifests as unbounded RSS growth.
+            # The remote handle_ping() handler loops forever reading pings,
+            # so the stream stays alive. QUIC idle timeout handles cleanup
+            # if the connection dies.
             event = PingEvent(peer_id=peer_id, rtts=rtts, failure_error=None)
         except Exception as error:
             try:
