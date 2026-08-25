@@ -1012,17 +1012,17 @@ class QUICConnection(IRawConnection, IMuxedConn):
         """
         if stream_id in self._streams:
             stream = self._streams.pop(stream_id)
-            # Remove from cache too
             self._stream_cache.pop(stream_id, None)
-            # Remember the id so late/duplicate events (retransmissions of
-            # FIN/reset frames) don't spawn a "ghost" wrapper for a stream
-            # that was already handled and closed.
             self._recently_closed_streams.append(stream_id)
 
-            # Update stream counts asynchronously
+            # Capture only the direction (not the stream object) to avoid
+            # keeping a reference to the QUICStream (and its receive buffer)
+            # alive in the closure until the task runs.
+            is_outbound = stream.direction == StreamDirection.OUTBOUND
+
             async def update_counts() -> None:
                 async with self._stream_lock:
-                    if stream.direction == StreamDirection.OUTBOUND:
+                    if is_outbound:
                         self._outbound_stream_count = max(
                             0, self._outbound_stream_count - 1
                         )
@@ -1032,7 +1032,6 @@ class QUICConnection(IRawConnection, IMuxedConn):
                         )
                     self._stats["streams_closed"] += 1
 
-            # Schedule count update if we're in a trio context
             if self._nursery:
                 self._nursery.start_soon(update_counts)
 
@@ -1844,7 +1843,12 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 self._socket = None
 
             self._streams.clear()
-            self._stream_cache.clear()  # Clear cache
+            self._stream_cache.clear()
+            self._stream_accept_queue.clear()
+            self._handshake_events.clear()
+            self._task_cancel_scopes.clear()
+            self._peer_certificate = None
+            self._stream_handler = None
             self._closed_event.set()
 
             # Immediately cancel background tasks (receiver, event loop, maintenance)
