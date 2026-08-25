@@ -721,8 +721,12 @@ class QUICStream(IMuxedStream):
         if self._memory_reserved > 0:
             self._release_memory(self._memory_reserved)
 
-        # Do not clear receive buffer here. Allow application to drain it
-        # before surfacing EOF/reset.
+        # Clear the receive buffer to release C-level memory immediately.
+        # The old comment ("allow application to drain") kept the buffer
+        # alive until GC collected the QUICStream, but reference cycles
+        # between QUICStream → QUICConnection → aioquic prevent timely
+        # collection, causing indefinite RSS growth.
+        self._receive_buffer.clear()
 
         # Release resource scope if present
         if self._resource_scope:
