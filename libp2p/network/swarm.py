@@ -2725,6 +2725,27 @@ class Swarm(Service, INetworkService):
             # Call notifiers since event occurred
             await self.notify_connected(swarm_conn)
 
+            # Second guard: the connection may have died DURING notify_connected,
+            # which yields at Trio checkpoints while calling all registered
+            # notifees.  If that happened, _cleanup() already ran remove_conn()
+            # (no-op since we hadn't appended yet, or race with append) and
+            # popped _conn_meta.  But connected() in notify_connected just set
+            # _conn_meta — so now we have an orphaned entry.  Detect and clean up.
+            if swarm_conn.event_closed.is_set():
+                logger.warning(
+                    "add_conn: swarm_conn closed DURING notify_connected for "
+                    "peer=%s id=%d — cleaning up orphaned _conn_meta entry",
+                    peer_id,
+                    id(swarm_conn),
+                )
+                # remove_conn may already have removed it (if _cleanup raced);
+                # calling it again is safe (idempotent via list comprehension).
+                self.remove_conn(swarm_conn)
+                await self.notify_disconnected(swarm_conn)
+                raise SwarmException(
+                    "SwarmConn closed during notify_connected; cleaned up"
+                )
+
             logger.info(
                 "add_conn: connected notifee completed for peer=%s id(swarm_conn)=%d is_closed=%s",
                 peer_id,
