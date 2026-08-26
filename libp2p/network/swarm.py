@@ -2659,6 +2659,14 @@ class Swarm(Service, INetworkService):
             self.manager.run_task(swarm_conn.start)
             await swarm_conn.event_started.wait()
 
+            # Guard against race: SwarmConn's lifecycle task detected a dead
+            # muxed_conn and closed itself before we could register it.
+            # Without this, the closed SwarmConn is added to self.connections
+            # but its in-flight disconnected() notifee pops the _conn_meta
+            # that connected() is about to set, creating a zombie entry.
+            if swarm_conn.event_closed.is_set():
+                raise SwarmException("SwarmConn closed during start")
+
             # Add to connections dict with deduplication
             peer_id = muxed_conn.peer_id
             if peer_id not in self.connections:
