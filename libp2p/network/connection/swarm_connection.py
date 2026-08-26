@@ -136,6 +136,13 @@ class SwarmConn(INetConn):
         """Handle closure of the underlying muxed connection."""
         peer_id = self.muxed_conn.peer_id
         logging.debug(f"SwarmConn closing for peer {peer_id} due to muxed_conn closure")
+        logging.info(
+            "SwarmConn._on_muxed_conn_closed: peer=%s id=%d event_started=%s event_closed=%s",
+            peer_id,
+            id(self),
+            self.event_started.is_set(),
+            self.event_closed.is_set(),
+        )
         # Only call close if we're not already closing
         if not self.event_closed.is_set():
             await self.close()
@@ -202,7 +209,11 @@ class SwarmConn(INetConn):
 
     async def _cleanup(self) -> None:
         # Remove the connection from swarm
-        logging.debug(f"Removing connection for peer {self.muxed_conn.peer_id}")
+        logging.info(
+            "SwarmConn._cleanup: peer=%s id=%d removing from swarm",
+            self.muxed_conn.peer_id,
+            id(self),
+        )
         self.swarm.remove_conn(self)
 
         # Only close the connection if it's not already closed and not shared
@@ -234,6 +245,11 @@ class SwarmConn(INetConn):
 
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
+        logging.info(
+            "SwarmConn._handle_new_streams: peer=%s id=%d started",
+            self.muxed_conn.peer_id,
+            id(self),
+        )
         async with trio.open_nursery() as nursery:
             # Also exit the loop once this SwarmConn has been closed — this
             # lets a duplicate (shared-muxed-conn) wrapper stop promptly
@@ -242,12 +258,20 @@ class SwarmConn(INetConn):
                 try:
                     stream = await self.muxed_conn.accept_stream()
                 except MuxedConnUnavailable:
+                    logging.info(
+                        "SwarmConn._handle_new_streams: peer=%s id=%d MuxedConnUnavailable - closing",
+                        self.muxed_conn.peer_id,
+                        id(self),
+                    )
                     await self.close()
                     break
                 except Exception as e:
                     # Catch QUICConnectionClosedError and other unexpected disconnects
-                    logging.debug(
-                        f"Connection closed for peer {self.muxed_conn.peer_id}: {e}"
+                    logging.info(
+                        "SwarmConn._handle_new_streams: peer=%s id=%d exception=%s - closing",
+                        self.muxed_conn.peer_id,
+                        id(self),
+                        type(e).__name__,
                     )
                     await self.close()
                     break
@@ -258,6 +282,11 @@ class SwarmConn(INetConn):
                 # Asynchronously handle the accepted stream, to avoid blocking
                 # the next stream.
                 nursery.start_soon(self._handle_muxed_stream, stream)
+        logging.info(
+            "SwarmConn._handle_new_streams: peer=%s id=%d nursery exited",
+            self.muxed_conn.peer_id,
+            id(self),
+        )
 
     async def _handle_muxed_stream(self, muxed_stream: IMuxedStream) -> None:
         # Acquire semaphore slot for inbound stream (queues if at capacity)

@@ -2725,6 +2725,13 @@ class Swarm(Service, INetworkService):
             # Call notifiers since event occurred
             await self.notify_connected(swarm_conn)
 
+            logger.info(
+                "add_conn: connected notifee completed for peer=%s id(swarm_conn)=%d is_closed=%s",
+                peer_id,
+                id(swarm_conn),
+                swarm_conn.event_closed.is_set(),
+            )
+
             listen_conn_event = ListenConn()
             listen_conn_event.conn_open = True
             listen_conn_event.peer_id = str(peer_id)
@@ -2984,6 +2991,7 @@ class Swarm(Service, INetworkService):
         the connection.
         """
         peer_id = swarm_conn.muxed_conn.peer_id
+        conn_count_before = len(self.connections.get(peer_id, []))
 
         if peer_id in self.connections:
             self.connections[peer_id] = [
@@ -2991,6 +2999,14 @@ class Swarm(Service, INetworkService):
             ]
             if not self.connections[peer_id]:
                 del self.connections[peer_id]
+
+        logger.info(
+            "remove_conn: peer=%s id=%d conns_before=%d conns_after=%d",
+            peer_id,
+            id(swarm_conn),
+            conn_count_before,
+            len(self.connections.get(peer_id, [])),
+        )
 
         # Decrement the connection-lifecycle tracker so per-direction and
         # per-peer established counts stay in sync (Bug 1).  Safe to call for
@@ -3051,7 +3067,10 @@ class Swarm(Service, INetworkService):
                         await getattr(n, method_name)(self, *args)
                     except Exception:
                         logger.exception(
-                            "Notifee %s.%s raised", type(n).__name__, method_name
+                            "Notifee %s.%s raised for %s",
+                            type(n).__name__,
+                            method_name,
+                            args[0] if args else "no-conn",
                         )
 
                 nursery.start_soon(_call)
