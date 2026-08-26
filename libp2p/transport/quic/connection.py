@@ -593,6 +593,9 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 # Check for idle streams that can be cleaned up
                 await self._cleanup_idle_streams()
 
+                # Check for orphaned streams (active but no activity for a long time)
+                await self._cleanup_orphaned_streams()
+
                 if logger.isEnabledFor(logging.DEBUG):
                     cid_stats = self.get_connection_id_stats()
                     logger.debug(f"Connection ID stats: {cid_stats}")
@@ -664,6 +667,21 @@ class QUICConnection(IRawConnection, IMuxedConn):
             raise
         finally:
             logger.debug("Client packet receiver terminated")
+            # If the receiver exits while connection is not closed, trigger
+            # cleanup. This handles the silent socket death case where OSError
+            # breaks the loop but nobody calls close().
+            if not self._closed:
+                logger.warning(
+                    "Client packet receiver exited unexpectedly for peer %s, "
+                    "triggering connection cleanup",
+                    self._remote_peer_id,
+                )
+                try:
+                    await self._handle_connection_error(
+                        OSError("Packet receiver terminated unexpectedly")
+                    )
+                except Exception as e:
+                    logger.debug(f"Error triggering cleanup from receiver exit: {e}")
 
     # Security and identity methods
 
@@ -2134,6 +2152,45 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         for stream_id in streams_to_cleanup:
             self._remove_stream(int(stream_id))
+
+    async def _cleanup_orphaned_streams(self) -> None:
+        """Detect and close orphaned streams that have no activity for too long.
+
+        Orphaned streams are streams that are open but have not had any data
+        flow for ORPHANED_STREAM_TIMEOUT seconds. This handles the case where
+        a connection dies but streams remain in _streams dict.
+        """
+        ORPHANED_STREAM_TIMEOUT = 300  # 5 minutes
+        current_time = time.time()
+        streams_to_reset = []
+
+        for stream in list(self._streams.values()):
+            if stream.is_closed() or stream.is_reset():
+                continue
+
+            # Check if stream has been inactive for too long
+            if hasattr(stream, "_timeline"):
+                last_activity = stream._timeline.last_activity
+                age = current_time - last_activity
+                if age > ORPHANED_STREAM_TIMEOUT:
+                    streams_to_reset.append(stream)
+                    logger.debug(
+                        "Found orphaned stream %s (age=%.0fs, direction=%s)",
+                        stream.stream_id, age, stream.direction,
+                    )
+
+        if streams_to_reset:
+            logger.warning(
+                "Resetting %d orphaned streams on connection to %s",
+                len(streams_to_reset), self._remote_peer_id,
+            )
+            for stream in streams_to_reset:
+                try:
+                    with trio.move_on_after(0.5):
+                        await stream.reset(error_code=0)
+                except Exception:
+                    # Force remove if reset fails
+                    self._remove_stream(int(stream.stream_id))
 
     def get_transport_addresses(self) -> list[Multiaddr]:
         """

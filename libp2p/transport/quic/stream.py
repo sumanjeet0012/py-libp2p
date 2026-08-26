@@ -82,6 +82,7 @@ class StreamTimeline:
         self.closed_at: float | None = None
         self.reset_at: float | None = None
         self.error_code: int | None = None
+        self.last_activity: float = time.time()
 
     def record_open(self) -> None:
         self.opened_at = time.time()
@@ -89,6 +90,7 @@ class StreamTimeline:
     def record_first_data(self) -> None:
         if self.first_data_at is None:
             self.first_data_at = time.time()
+        self.last_activity = time.time()
 
     def record_close(self) -> None:
         self.closed_at = time.time()
@@ -96,6 +98,10 @@ class StreamTimeline:
     def record_reset(self, error_code: int) -> None:
         self.reset_at = time.time()
         self.error_code = error_code
+
+    def touch(self) -> None:
+        """Update last_activity timestamp."""
+        self.last_activity = time.time()
 
 
 class QUICStream(IMuxedStream):
@@ -397,6 +403,7 @@ class QUICStream(IMuxedStream):
             await self._connection._transmit()
 
             self._write_closed = True
+            self._timeline.touch()
 
             async with self._state_lock:
                 if self._read_closed:
@@ -439,6 +446,7 @@ class QUICStream(IMuxedStream):
 
         try:
             self._read_closed = True
+            self._timeline.touch()
 
             async with self._state_lock:
                 if self._write_closed:
