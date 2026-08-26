@@ -555,6 +555,7 @@ class TestPeerRouting:
         peer_id = create_valid_peer_id("test")
         duplicate_peer = create_valid_peer_id("duplicate")
         new_peers = [duplicate_peer]  # Pre-existing peer
+        responding_peers: list = []
 
         # Mock query to return the same peer
         mock_result = [duplicate_peer, create_valid_peer_id("new")]
@@ -562,7 +563,7 @@ class TestPeerRouting:
             peer_routing, "_query_peer_for_closest", return_value=mock_result
         ):
             await peer_routing._query_single_peer_for_closest(
-                peer_id, target_key, new_peers
+                peer_id, target_key, new_peers, responding_peers
             )
 
             # Should not add duplicate
@@ -634,7 +635,7 @@ class TestPeerRouting:
         extra_peers = [create_valid_peer_id(f"sw_peer{i}") for i in range(3, 5)]
         started_at: dict[str, float] = {}
 
-        async def mock_query(peer, _target_key, new_peers):
+        async def mock_query(peer, _target_key, new_peers, _responding_peers=None):
             started_at[str(peer)] = trio.current_time()
             # Peer 2 is slow; all others are fast
             if peer == initial_peers[2]:
@@ -692,7 +693,7 @@ class TestPeerRouting:
         group3 = [create_valid_peer_id(f"vol_g3_{i}") for i in range(ALPHA)]
         queried_peers: list[ID] = []
 
-        async def mock_query(peer, _target_key, new_peers):
+        async def mock_query(peer, _target_key, new_peers, _responding_peers=None):
             queried_peers.append(peer)
             await trio.sleep(0)
             # Group 1 queries discover group 2 peers
