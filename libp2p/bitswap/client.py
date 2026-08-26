@@ -767,6 +767,11 @@ class BitswapClient(INotifee):
             self._peer_protocols[peer_id] = str(protocol)
 
         STREAM_IDLE_TIMEOUT = 60.0
+        # Subsequent reads on the same stream use a shorter timeout.
+        # Provider response streams send one message then close; if the
+        # stream EOF doesn't propagate immediately (Yamux FIN latency),
+        # using the full 60 s timeout causes a 60 s hang per block request.
+        SUBSEQUENT_READ_TIMEOUT = 5.0
 
         try:
             try:
@@ -784,7 +789,7 @@ class BitswapClient(INotifee):
 
             while True:
                 try:
-                    with trio.fail_after(STREAM_IDLE_TIMEOUT):
+                    with trio.fail_after(SUBSEQUENT_READ_TIMEOUT):
                         msg = await self._read_message(stream)
                 except trio.TooSlowError:
                     break
@@ -799,6 +804,7 @@ class BitswapClient(INotifee):
                 await stream.close()
             except Exception as e:
                 logger.debug(f"Error closing stream from {peer_id}: {e}")
+
 
     async def _process_message(
         self, msg: Message, peer_id: PeerID, stream: INetStream

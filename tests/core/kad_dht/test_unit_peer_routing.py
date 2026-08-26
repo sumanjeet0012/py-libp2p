@@ -510,6 +510,7 @@ class TestPeerRouting:
         target_key = b"target_key"
         peer_id = create_valid_peer_id("test")
         new_peers = []
+        responding_peers = []
 
         # Mock successful query
         mock_result = [create_valid_peer_id("result1"), create_valid_peer_id("result2")]
@@ -517,11 +518,13 @@ class TestPeerRouting:
             peer_routing, "_query_peer_for_closest", return_value=mock_result
         ):
             await peer_routing._query_single_peer_for_closest(
-                peer_id, target_key, new_peers
+                peer_id, target_key, new_peers, responding_peers
             )
 
             assert len(new_peers) == 2
             assert all(peer in new_peers for peer in mock_result)
+            # peer_id should be in responding_peers since it returned results
+            assert peer_id in responding_peers
 
     @pytest.mark.trio
     async def test_query_single_peer_for_closest_failure(self, peer_routing):
@@ -529,6 +532,7 @@ class TestPeerRouting:
         target_key = b"target_key"
         peer_id = create_valid_peer_id("test")
         new_peers = []
+        responding_peers = []
 
         # Mock query failure
         with patch.object(
@@ -537,11 +541,12 @@ class TestPeerRouting:
             side_effect=Exception("Query failed"),
         ):
             await peer_routing._query_single_peer_for_closest(
-                peer_id, target_key, new_peers
+                peer_id, target_key, new_peers, responding_peers
             )
 
             # Should handle exception gracefully
             assert len(new_peers) == 0
+            assert len(responding_peers) == 0
 
     @pytest.mark.trio
     async def test_query_single_peer_deduplication(self, peer_routing):
