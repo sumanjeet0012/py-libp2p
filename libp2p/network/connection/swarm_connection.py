@@ -103,6 +103,13 @@ class SwarmConn(INetConn):
         # entries in ConnectionStatsTracker (had_meta=False disconnect path).
         self._connected_notified: bool = False
 
+        # Guard flag: set to True the first time _notify_disconnected() fires.
+        # Prevents double-disconnect: add_conn's second guard calls
+        # swarm.notify_disconnected() directly, and _cleanup() can later call
+        # _notify_disconnected() again — the second call produces a
+        # had_meta=False zombie because _conn_meta was already popped.
+        self._disconnect_notified: bool = False
+
     def set_resource_scope(self, scope: Any) -> None:
         """Set the resource scope for this connection."""
         self._resource_scope = scope
@@ -368,6 +375,14 @@ class SwarmConn(INetConn):
         return net_stream
 
     async def _notify_disconnected(self) -> None:
+        if self._disconnect_notified:
+            logging.debug(
+                "SwarmConn._notify_disconnected: already fired for peer=%s id=%d — skipping",
+                self.muxed_conn.peer_id,
+                id(self),
+            )
+            return
+        self._disconnect_notified = True
         await self.swarm.notify_disconnected(self)
 
     async def start(self) -> None:

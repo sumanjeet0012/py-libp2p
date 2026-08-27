@@ -2747,6 +2747,11 @@ class Swarm(Service, INetworkService):
                 # remove_conn may already have removed it (if _cleanup raced);
                 # calling it again is safe (idempotent via list comprehension).
                 self.remove_conn(swarm_conn)
+                # Mark disconnect as notified BEFORE calling notify_disconnected so
+                # that _cleanup()'s subsequent _notify_disconnected() call (which
+                # runs when the SwarmConn's nursery task eventually exits) sees the
+                # flag and skips — preventing a double-disconnect had_meta=False zombie.
+                swarm_conn._disconnect_notified = True  # type: ignore[attr-defined]
                 await self.notify_disconnected(swarm_conn)
                 raise SwarmException(
                     "SwarmConn closed during notify_connected; cleaned up"
