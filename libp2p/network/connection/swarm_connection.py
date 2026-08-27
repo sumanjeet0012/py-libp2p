@@ -95,6 +95,14 @@ class SwarmConn(INetConn):
             )
             setattr(muxed_conn, "on_close", self._on_muxed_conn_closed)
 
+        # Guard flag: set to True only after notify_connected() completes
+        # successfully.  _cleanup() checks this before calling
+        # _notify_disconnected() to ensure that connections rejected by limit-
+        # checks (which were never notified as "connected") never trigger a
+        # spurious "disconnected" notification — which would create zombie
+        # entries in ConnectionStatsTracker (had_meta=False disconnect path).
+        self._connected_notified: bool = False
+
     def set_resource_scope(self, scope: Any) -> None:
         """Set the resource scope for this connection."""
         self._resource_scope = scope
@@ -239,9 +247,20 @@ class SwarmConn(INetConn):
         # just emit before we cancel the stream handler tasks.
         await trio.sleep(0.1)
 
-        # Notify all listeners about the disconnection
-        logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
-        await self._notify_disconnected()
+        # Only notify disconnection if notify_connected() was previously called.
+        # Connections that were rejected by limit-checks in add_conn (after being
+        # briefly registered then immediately removed) never had notify_connected()
+        # called, so firing notify_disconnected() here would create a zombie entry
+        # in ConnectionStatsTracker (had_meta=False path).
+        if self._connected_notified:
+            logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
+            await self._notify_disconnected()
+        else:
+            logging.debug(
+                "SwarmConn._cleanup: skipping notify_disconnected for peer=%s "
+                "(notify_connected was never called — limit-rejected connection)",
+                self.muxed_conn.peer_id,
+            )
 
     async def _handle_new_streams(self) -> None:
         self.event_started.set()

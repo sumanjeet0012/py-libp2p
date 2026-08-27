@@ -2724,6 +2724,12 @@ class Swarm(Service, INetworkService):
 
             # Call notifiers since event occurred
             await self.notify_connected(swarm_conn)
+            # Mark that notify_connected completed — _cleanup() uses this to decide
+            # whether to fire notify_disconnected().  Must be set immediately after
+            # notify_connected() returns (before the event_closed check below) so
+            # that connections which die during notify_connected still get a proper
+            # disconnected notification.
+            swarm_conn._connected_notified = True  # type: ignore[attr-defined]
 
             # Second guard: the connection may have died DURING notify_connected,
             # which yields at Trio checkpoints while calling all registered
