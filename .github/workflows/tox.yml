@@ -63,7 +63,7 @@ jobs:
           path: |
             ~/.nimble
             ~/.choosenim/toolchains/*/lib
-          key: ${{ runner.os }}-nimble-${{ hashFiles('**/nim_echo_server.nim') }}
+          key: ${{ runner.os }}-nimble-${{ hashFiles('tests/interop/nim_libp2p/nim_echo_server.nim', 'tests/interop/nim_libp2p/scripts/setup_nim_echo.sh') }}
           restore-keys: |
             ${{ runner.os }}-nimble-
 
@@ -79,6 +79,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Setup Go for interop testing
+        if: matrix.toxenv == 'interop'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
 
       - run: |
           uv venv venv

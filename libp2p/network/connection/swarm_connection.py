@@ -14,8 +14,6 @@ from libp2p.abc import (
     IMuxedStream,
     INetConn,
 )
-from libp2p.metrics.muxer import MuxerEvent
-from libp2p.metrics.transport import ListenConn
 from libp2p.network.stream.net_stream import (
     NetStream,
     StreamState,
@@ -24,6 +22,8 @@ from libp2p.rcmgr import Direction
 from libp2p.stream_muxer.exceptions import (
     MuxedConnUnavailable,
 )
+from libp2p.stream_muxer.mplex.mplex import MPLEX_PROTOCOL_ID
+from libp2p.stream_muxer.yamux.yamux import PROTOCOL_ID as YAMUX_PROTOCOL_ID
 
 if TYPE_CHECKING:
     from libp2p.network.swarm import Swarm  # noqa: F401
@@ -44,6 +44,8 @@ class SwarmConn(INetConn):
     _direction: Direction
     _actual_transport_addresses: list[Multiaddr] | None
     _connection_type: ConnectionType
+    _negotiated_security_protocol: str | None
+    _negotiated_muxer_protocol: str | None
     _metric_send_channel: trio.MemorySendChannel[Any] | None = None
 
     def __init__(
@@ -68,6 +70,8 @@ class SwarmConn(INetConn):
             self._direction = Direction.from_string(str(direction))
         self._actual_transport_addresses = None
         self._connection_type = ConnectionType.UNKNOWN
+        self._negotiated_security_protocol = None
+        self._negotiated_muxer_protocol = None
         # Provide back-references/hooks expected by NetStream
         try:
             setattr(self.muxed_conn, "swarm", self.swarm)
@@ -92,21 +96,6 @@ class SwarmConn(INetConn):
                 f"Could not attach on_close hook for peer {muxed_conn.peer_id}: {e}"
             )
             # The muxed_conn doesn't support on_close; this is acceptable
-
-        # Guard flag: set to True only after notify_connected() completes
-        # successfully.  _cleanup() checks this before calling
-        # _notify_disconnected() to ensure that connections rejected by limit-
-        # checks (which were never notified as "connected") never trigger a
-        # spurious "disconnected" notification — which would create zombie
-        # entries in ConnectionStatsTracker (had_meta=False disconnect path).
-        self._connected_notified: bool = False
-
-        # Guard flag: set to True the first time _notify_disconnected() fires.
-        # Prevents double-disconnect: add_conn's second guard calls
-        # swarm.notify_disconnected() directly, and _cleanup() can later call
-        # _notify_disconnected() again — the second call produces a
-        # had_meta=False zombie because _conn_meta was already popped.
-        self._disconnect_notified: bool = False
 
     def set_resource_scope(self, scope: Any) -> None:
         """Set the resource scope for this connection."""
@@ -149,13 +138,6 @@ class SwarmConn(INetConn):
         """Handle closure of the underlying muxed connection."""
         peer_id = self.muxed_conn.peer_id
         logging.debug(f"SwarmConn closing for peer {peer_id} due to muxed_conn closure")
-        logging.info(
-            "SwarmConn._on_muxed_conn_closed: peer=%s id=%d event_started=%s event_closed=%s",
-            peer_id,
-            id(self),
-            self.event_started.is_set(),
-            self.event_closed.is_set(),
-        )
         # Only call close if we're not already closing
         if not self.event_closed.is_set():
             await self.close()
@@ -165,19 +147,6 @@ class SwarmConn(INetConn):
             return
         logging.debug(f"Closing SwarmConn for peer {self.muxed_conn.peer_id}")
         self.event_closed.set()
-
-        conn_event = ListenConn()
-        conn_event.conn_close = True
-        conn_event.peer_id = str(self.muxed_conn.peer_id)
-        conn_event.connection_type = (
-            getattr(self._connection_type, "value", str(self._connection_type))
-            if getattr(self, "_connection_type", None) is not None
-            else "unknown"
-        )
-        actual_addrs = getattr(self, "_actual_transport_addresses", None)
-        if actual_addrs:
-            conn_event.remote_maddr = ",".join(str(a) for a in actual_addrs)
-        self.swarm._event_bus.emit(conn_event)
 
         # Clean up resource scope if it exists
         if self._resource_scope is not None:
@@ -222,11 +191,7 @@ class SwarmConn(INetConn):
 
     async def _cleanup(self) -> None:
         # Remove the connection from swarm
-        logging.info(
-            "SwarmConn._cleanup: peer=%s id=%d removing from swarm",
-            self.muxed_conn.peer_id,
-            id(self),
-        )
+        logging.debug(f"Removing connection for peer {self.muxed_conn.peer_id}")
         self.swarm.remove_conn(self)
 
         # Only close the connection if it's not already closed and not shared
@@ -252,28 +217,12 @@ class SwarmConn(INetConn):
         # just emit before we cancel the stream handler tasks.
         await trio.sleep(0.1)
 
-        # Only notify disconnection if notify_connected() was previously called.
-        # Connections that were rejected by limit-checks in add_conn (after being
-        # briefly registered then immediately removed) never had notify_connected()
-        # called, so firing notify_disconnected() here would create a zombie entry
-        # in ConnectionStatsTracker (had_meta=False path).
-        if self._connected_notified:
-            logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
-            await self._notify_disconnected()
-        else:
-            logging.debug(
-                "SwarmConn._cleanup: skipping notify_disconnected for peer=%s "
-                "(notify_connected was never called — limit-rejected connection)",
-                self.muxed_conn.peer_id,
-            )
+        # Notify all listeners about the disconnection
+        logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
+        await self._notify_disconnected()
 
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
-        logging.info(
-            "SwarmConn._handle_new_streams: peer=%s id=%d started",
-            self.muxed_conn.peer_id,
-            id(self),
-        )
         async with trio.open_nursery() as nursery:
             # Also exit the loop once this SwarmConn has been closed — this
             # lets a duplicate (shared-muxed-conn) wrapper stop promptly
@@ -281,22 +230,36 @@ class SwarmConn(INetConn):
             while not self.event_closed.is_set():
                 try:
                     stream = await self.muxed_conn.accept_stream()
-                except MuxedConnUnavailable:
-                    logging.info(
-                        "SwarmConn._handle_new_streams: peer=%s id=%d MuxedConnUnavailable - closing",
-                        self.muxed_conn.peer_id,
-                        id(self),
+                except MuxedConnUnavailable as e:
+                    from libp2p.utils.connection_shutdown import (
+                        log_expected_connection_shutdown,
+                    )
+
+                    log_expected_connection_shutdown(
+                        component="SwarmConn.accept_stream",
+                        peer_id=self.muxed_conn.peer_id,
+                        direction="remote",
+                        exc=e,
                     )
                     await self.close()
                     break
                 except Exception as e:
-                    # Catch QUICConnectionClosedError and other unexpected disconnects
-                    logging.info(
-                        "SwarmConn._handle_new_streams: peer=%s id=%d exception=%s - closing",
-                        self.muxed_conn.peer_id,
-                        id(self),
-                        type(e).__name__,
+                    from libp2p.utils.connection_shutdown import (
+                        is_expected_connection_shutdown,
+                        log_expected_connection_shutdown,
                     )
+
+                    if is_expected_connection_shutdown(e):
+                        log_expected_connection_shutdown(
+                            component="SwarmConn.accept_stream",
+                            peer_id=self.muxed_conn.peer_id,
+                            direction="remote",
+                            exc=e,
+                        )
+                    else:
+                        logging.debug(
+                            f"Connection closed for peer {self.muxed_conn.peer_id}: {e}"
+                        )
                     await self.close()
                     break
                 # The connection may have been closed while we were waiting
@@ -306,11 +269,6 @@ class SwarmConn(INetConn):
                 # Asynchronously handle the accepted stream, to avoid blocking
                 # the next stream.
                 nursery.start_soon(self._handle_muxed_stream, stream)
-        logging.info(
-            "SwarmConn._handle_new_streams: peer=%s id=%d nursery exited",
-            self.muxed_conn.peer_id,
-            id(self),
-        )
 
     async def _handle_muxed_stream(self, muxed_stream: IMuxedStream) -> None:
         # Acquire semaphore slot for inbound stream (queues if at capacity)
@@ -347,11 +305,6 @@ class SwarmConn(INetConn):
         net_stream = await self._add_stream(muxed_stream)
         # Tag stream with direction so notify_closed_stream releases resources
         net_stream._direction = Direction.INBOUND
-        stream_event = MuxerEvent()
-        stream_event.stream_open = True
-        stream_event.direction = "inbound"
-        stream_event.peer_id = str(self.muxed_conn.peer_id)
-        self.swarm._event_bus.emit(stream_event)
         try:
             await self.swarm.common_stream_handler(net_stream)
         finally:
@@ -373,14 +326,6 @@ class SwarmConn(INetConn):
         return net_stream
 
     async def _notify_disconnected(self) -> None:
-        if self._disconnect_notified:
-            logging.debug(
-                "SwarmConn._notify_disconnected: already fired for peer=%s id=%d — skipping",
-                self.muxed_conn.peer_id,
-                id(self),
-            )
-            return
-        self._disconnect_notified = True
         await self.swarm.notify_disconnected(self)
 
     async def start(self) -> None:
@@ -438,20 +383,99 @@ class SwarmConn(INetConn):
         self._actual_transport_addresses = addresses
         self._connection_type = conn_type
 
+    def set_negotiated_protocols(
+        self,
+        security_protocol: str | None,
+        muxer_protocol: str | None,
+    ) -> None:
+        self._negotiated_security_protocol = security_protocol
+        self._negotiated_muxer_protocol = muxer_protocol
+
+    def get_negotiated_security_protocol(self) -> str | None:
+        if self._negotiated_security_protocol is not None:
+            return self._negotiated_security_protocol
+
+        for conn in (
+            self.muxed_conn,
+            getattr(self.muxed_conn, "secured_conn", None),
+        ):
+            protocol = getattr(conn, "negotiated_security_protocol", None)
+            if protocol is not None:
+                return str(protocol)
+        return None
+
+    def get_negotiated_muxer_protocol(self) -> str | None:
+        if self._negotiated_muxer_protocol is not None:
+            return self._negotiated_muxer_protocol
+
+        protocol = getattr(self.muxed_conn, "negotiated_muxer_protocol", None)
+        if protocol is not None:
+            return str(protocol)
+
+        muxed_conn_type = type(self.muxed_conn).__name__
+        if muxed_conn_type == "Yamux":
+            return YAMUX_PROTOCOL_ID
+        if muxed_conn_type == "Mplex":
+            return str(MPLEX_PROTOCOL_ID)
+        return None
+
+    def _get_connection_type_metadata(self) -> ConnectionType:
+        if self._connection_type != ConnectionType.UNKNOWN:
+            return self._connection_type
+        try:
+            conn_type = self.muxed_conn.get_connection_type()
+            if conn_type != ConnectionType.UNKNOWN:
+                return conn_type
+        except Exception:
+            pass
+
+        transport_addresses = self.get_transport_addresses()
+        if any("/p2p-circuit" in str(addr) for addr in transport_addresses):
+            return ConnectionType.RELAYED
+        if transport_addresses:
+            return ConnectionType.DIRECT
+        return self._connection_type
+
+    def get_transport_family(self) -> str:
+        for addr in self.get_transport_addresses():
+            addr_text = str(addr)
+            if "/webtransport" in addr_text:
+                return "webtransport"
+            if "/quic-v1" in addr_text:
+                return "quic-v1"
+            if "/wss" in addr_text:
+                return "wss"
+            if "/ws" in addr_text:
+                return "ws"
+            if "/tcp/" in addr_text:
+                return "tcp"
+            if "/udp/" in addr_text:
+                return "udp"
+        return "unknown"
+
+    def get_interop_metadata(self) -> dict[str, Any]:
+        transport_family = self.get_transport_family()
+        muxer_protocol = self.get_negotiated_muxer_protocol()
+        if muxer_protocol is None and transport_family == "quic-v1":
+            muxer_protocol = "n/a"
+        return {
+            "transport_family": transport_family,
+            "transport_addresses": [
+                str(addr) for addr in self.get_transport_addresses()
+            ],
+            "connection_type": self._get_connection_type_metadata().value,
+            "security_protocol": self.get_negotiated_security_protocol(),
+            "muxer_protocol": muxer_protocol,
+        }
+
     def remove_stream(self, stream: NetStream) -> None:
         if stream not in self.streams:
             return
         self.streams.remove(stream)
-        direction = str(getattr(stream, "_direction", Direction.UNKNOWN))
-        stream_event = MuxerEvent()
-        stream_event.stream_close = True
-        stream_event.direction = direction
-        stream_event.peer_id = str(self.muxed_conn.peer_id)
-        self.swarm._event_bus.emit(stream_event)
 
     async def _remove_stream(self, stream: NetStream) -> None:
         """Remove stream and notify about closure."""
         if stream not in self.streams:
             return
-        self.remove_stream(stream)
+        self.streams.remove(stream)
         await self.swarm.notify_closed_stream(stream)

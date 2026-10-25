@@ -744,16 +744,58 @@ class WebsocketTransport(ITransport):
             try:
                 async with trio.open_nursery() as conn_nursery:
                     try:
-                        from trio_websocket import connect_websocket_url
+                        from trio import aclose_forcefully
+                        from trio_websocket import wrap_client_stream
 
+                        # Own the socket in this task instead of letting
+                        # connect_websocket_url open and manage it from a
+                        # background reader task: a refused certificate or an
+                        # unanswered upgrade would otherwise leave the socket
+                        # open on every failed dial, which leaked both file
+                        # descriptors and RSS in production. (Upstream fix.)
                         with trio.fail_after(self._config.handshake_timeout):
-                            ws = await connect_websocket_url(
-                                conn_nursery,
-                                ws_url,
-                                ssl_context=ssl_context,
-                                message_queue_size=1024,
-                                max_message_size=self._config.max_message_size,
-                            )
+                            stream: trio.SocketStream | trio.SSLStream
+                            stream = await trio.open_tcp_stream(host, port)
+                            try:
+                                if ssl_context is not None:
+                                    stream = trio.SSLStream(
+                                        stream,
+                                        ssl_context,
+                                        server_hostname=host,
+                                        https_compatible=True,
+                                    )
+                                    try:
+                                        await stream.do_handshake()
+                                    except Exception as exc:
+                                        ssl_error = _find_ssl_error(exc)
+                                        if ssl_error is None:
+                                            raise
+                                        raise OpenConnectionError(
+                                            "TLS handshake failed for "
+                                            f"{ws_url}: {ssl_error}"
+                                        ) from ssl_error
+
+                                # trio_websocket omits the port from the Host
+                                # header on the default ports.
+                                host_header = (
+                                    host if port in (80, 443) else f"{host}:{port}"
+                                )
+                                ws = await wrap_client_stream(
+                                    conn_nursery,
+                                    stream,
+                                    host_header,
+                                    "/",
+                                    message_queue_size=1024,
+                                    max_message_size=self._config.max_message_size,
+                                )
+                            except BaseException:
+                                # Includes the trio.Cancelled raised by
+                                # fail_after: shield the close, otherwise the
+                                # socket leaks exactly when the handshake times
+                                # out.
+                                with trio.CancelScope(shield=True):
+                                    await aclose_forcefully(stream)
+                                raise
                     except BaseException as exc:
                         await result_send.send(exc)
                         return

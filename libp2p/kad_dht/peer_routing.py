@@ -309,11 +309,19 @@ class PeerRouting(IPeerRouting):
                 # newly discovered peers before admitting the next batch.
                 # Exclude self - we can't query ourselves (Kubo does the same)
                 local_id = self.host.get_id()
-                peers_to_query = [
+                candidates = [
                     p
                     for p in closest_peers
                     if p not in queried_peers and p != local_id
-                ][:ALPHA]
+                ]
+                # Draw the batch at random from the candidate window instead of
+                # always taking the strictly closest ALPHA. Every candidate is
+                # already within the `count` closest peers we know of, so
+                # convergence is preserved, but a Sybil peer sitting at the
+                # closest XOR position is no longer guaranteed a slot in the
+                # *first* round and so cannot shape the lookup path from hop
+                # one. See issue #1384.
+                peers_to_query = _rng.sample(candidates, min(ALPHA, len(candidates)))
                 if not peers_to_query:
                     logger.debug("No more unqueried peers available, ending lookup")
                     break
@@ -354,6 +362,23 @@ class PeerRouting(IPeerRouting):
 
                 # Check if we made any progress (found closer peers)
                 if closest_peers == old_closest_peers:
+                    # Kademlia terminates once the closest known peers have been
+                    # contacted. Because admission is randomised, a round can
+                    # fail to improve while the closest peers are still
+                    # unqueried, so keep going until the BETA closest have been
+                    # queried. Bounded by MAX_PEER_LOOKUP_ROUNDS and the 30s
+                    # deadline above.
+                    unqueried_beta = [
+                        p
+                        for p in closest_peers[:BETA]
+                        if p not in queried_peers and p != local_id
+                    ]
+                    if unqueried_beta:
+                        logger.debug(
+                            f"No improvement but {len(unqueried_beta)} of the "
+                            "BETA closest peers are unqueried, continuing"
+                        )
+                        continue
                     logger.debug("No improvement in closest peers, ending lookup")
                     break
 
