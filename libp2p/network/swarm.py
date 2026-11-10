@@ -51,6 +51,7 @@ from libp2p.io.abc import (
     ReadWriteCloser,
 )
 from libp2p.network.auto_connector import AutoConnector
+from libp2p.network.backoff import DialBackoff
 from libp2p.network.config import ConnectionConfig, RetryConfig
 from libp2p.network.connection_gate import ConnectionGate
 from libp2p.network.connection_pruner import ConnectionPruner
@@ -80,6 +81,7 @@ from libp2p.transport.upgrader import (
 from libp2p.utils.address_validation import (
     has_public_ipv6,
     is_public_ipv6_address,
+    is_public_or_dns_address,
     is_relay_address,
     is_routable_address,
 )
@@ -97,6 +99,7 @@ from .connection.raw_connection import (
 # SwarmConn is imported conditionally above
 from .exceptions import (
     SwarmDialAllFailedError,
+    SwarmDialBackoffError,
     SwarmException,
 )
 
@@ -106,8 +109,8 @@ _HAPPY_EYEBALLS_DELAY = (
     0.250  # 250ms head start for primary transport (matches go-libp2p DialDelay)
 )
 # Global max concurrent in-flight dials
-# (matches go-libp2p DefaultMaxConcurrentDials: 32)
-MAX_CONCURRENT_DIALS = 32
+# (matches go-libp2p ConcurrentFdDials: 160)
+MAX_CONCURRENT_DIALS = 160
 MAX_ADDRS_PER_PEER = 2  # Top 1-2 addresses per peer (at most 1 per transport class)
 _MAX_PARALLEL_DIALS = 2
 
@@ -305,6 +308,7 @@ class Swarm(Service, INetworkService):
         # Initialize connection management components
         self._init_connection_management()
         self._negative_peer_cache = _NegativePeerCache()
+        self.dial_backoff = DialBackoff()
 
         # Initialize health monitoring (opt-in Python extension)
         self.health_data = {}
@@ -850,6 +854,16 @@ class Swarm(Service, INetworkService):
                 # addresses (if any slipped past the filter) are tried
                 # last, only after every public attempt failed.
                 allowed_addrs.sort(key=lambda a: not is_routable_address(a))
+            else:
+                # If only local/private addresses exist (e.g. local dev / testing),
+                # filter loopback if non-loopback exists
+                non_loopback = [
+                    a
+                    for a in allowed_addrs
+                    if "/ip4/127." not in str(a) and "/ip6/::1" not in str(a)
+                ]
+                if non_loopback:
+                    allowed_addrs = non_loopback
 
             # Skip relay (p2p-circuit) addresses: this node has no relay
             # transport, so these can never be dialed (mirrors go-libp2p,
@@ -914,6 +928,21 @@ class Swarm(Service, INetworkService):
 
             allowed_addrs.sort(key=_transport_priority)
 
+            # Filter out addresses currently in dial backoff (matching go-libp2p)
+            unbacked_addrs = [
+                a
+                for a in allowed_addrs
+                if not self.dial_backoff.is_backed_off(peer_id, a)
+            ]
+            if unbacked_addrs:
+                allowed_addrs = unbacked_addrs
+            else:
+                logger.debug("All addresses for peer %s are in dial backoff", peer_id)
+                raise SwarmDialBackoffError(
+                    f"All addresses for peer {peer_id} are currently in dial backoff",
+                    peer_id=peer_id,
+                )
+
             # Smart Address Selection: pick top 1-2 addrs (at most 1 per class)
             selected_addrs: list[Multiaddr] = []
             seen_ranks: set[int] = set()
@@ -927,13 +956,18 @@ class Swarm(Service, INetworkService):
             if not selected_addrs:
                 selected_addrs = allowed_addrs[:MAX_ADDRS_PER_PEER]
 
-            connections = []
+            connections: list[INetConn] = []
             exceptions: list[SwarmException] = []
 
             # Try addresses using Happy Eyeballs with global concurrency limiter
             with trio.CancelScope() as cancel_scope:
                 async with trio.open_nursery() as nursery:
                     for multiaddr in selected_addrs:
+                        # If a connection has already been established by a prior
+                        # dial attempt, do not launch additional fallback dials.
+                        if connections or cancel_scope.cancel_called:
+                            break
+
                         failed_event = trio.Event()
 
                         async def dial_task(
@@ -953,6 +987,7 @@ class Swarm(Service, INetworkService):
                                         cancel_scope.cancel()
                             except SwarmException as e:
                                 exceptions.append(e)
+                                self.dial_backoff.add_backoff(peer_id, addr)
                                 logger.debug(
                                     "encountered exception when trying to "
                                     "connect to %s",
@@ -964,6 +999,7 @@ class Swarm(Service, INetworkService):
                                 logger.debug(
                                     f"Unexpected exception dialing {addr}: {e}"
                                 )
+                                self.dial_backoff.add_backoff(peer_id, addr)
                                 ev.set()
 
                         nursery.start_soon(dial_task)
@@ -1003,6 +1039,7 @@ class Swarm(Service, INetworkService):
                     except Exception as e:
                         logger.debug(f"Error closing excess connection: {e}")
 
+            self.dial_backoff.clear(peer_id)
             self._negative_peer_cache.evict(str(peer_id))
             return connections
         finally:
@@ -1053,6 +1090,7 @@ class Swarm(Service, INetworkService):
                         pass
                     # Addresses changed — lift any negative-cache block so the
                     # corrected addresses can be tried immediately (Bug 10).
+                    self.dial_backoff.clear(peer_id)
                     self._negative_peer_cache.evict(str(peer_id))
                     break
 
@@ -1094,6 +1132,37 @@ class Swarm(Service, INetworkService):
         # Add jitter to prevent synchronized retries
         jitter = delay * self.retry_config.jitter_factor
         return delay + random.uniform(-jitter, jitter)
+
+    async def _dial_transport(
+        self,
+        transport: ITransport,
+        addr: Multiaddr,
+        source: tuple[str, int] | None,
+    ) -> Any:
+        """
+        Open the transport-level connection to ``addr``, bounded by
+        :attr:`ConnectionConfig.dial_timeout`.
+
+        Without the bound an address that never answers (a SYN that is
+        dropped) waits on the operating system's connect timeout, which is
+        minutes.
+
+        :raises OpenConnectionError: when the dial does not complete in time
+        """
+        timeout = self.connection_config.dial_timeout
+        local_timeout = getattr(self.connection_config, "dial_timeout_local", None)
+        if local_timeout is not None and not is_public_or_dns_address(addr):
+            timeout = local_timeout
+        dial_with_source = getattr(transport, "dial_with_source", None)
+        try:
+            with trio.fail_after(timeout):
+                if source is not None and callable(dial_with_source):
+                    return await cast(Any, dial_with_source)(addr, source)
+                return await transport.dial(addr)
+        except trio.TooSlowError:
+            raise OpenConnectionError(
+                f"dial to {addr} timed out after {timeout}s"
+            ) from None
 
     async def _dial_addr_single_attempt(
         self,
@@ -1163,11 +1232,7 @@ class Swarm(Service, INetworkService):
             if not existing_p2p:
                 addr = Multiaddr(f"{addr}/p2p/{peer_id}")
 
-            dial_with_source = getattr(transport, "dial_with_source", None)
-            if source is not None and callable(dial_with_source):
-                raw_conn = await cast(Any, dial_with_source)(addr, source)
-            else:
-                raw_conn = await transport.dial(addr)
+            raw_conn = await self._dial_transport(transport, addr, source)
 
             # Enable PNET if psk is provided
             if self.psk is not None:
@@ -1270,15 +1335,17 @@ class Swarm(Service, INetworkService):
                 return swarm_conn
             except BaseException:
                 # Clean up on failure or cancellation
-                try:
-                    await raw_conn.close()
-                except Exception:
-                    pass
-                try:
-                    if pre_scope is not None and hasattr(pre_scope, "close"):
-                        pre_scope.close()
-                except Exception:
-                    pass
+                with trio.CancelScope() as cleanup_scope:
+                    cleanup_scope.shield = True
+                    try:
+                        await raw_conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        if pre_scope is not None and hasattr(pre_scope, "close"):
+                            pre_scope.close()
+                    except Exception:
+                        pass
                 raise
 
         logger.debug("dialed peer %s over base transport", peer_id)
@@ -1290,15 +1357,17 @@ class Swarm(Service, INetworkService):
             )
         except BaseException:
             # Ensure raw_conn is closed if upgrade fails or is cancelled
-            try:
-                await raw_conn.close()
-            except Exception:
-                pass
-            try:
-                if pre_scope is not None and hasattr(pre_scope, "close"):
-                    pre_scope.close()
-            except Exception:
-                pass
+            with trio.CancelScope() as cleanup_scope:
+                cleanup_scope.shield = True
+                try:
+                    await raw_conn.close()
+                except Exception:
+                    pass
+                try:
+                    if pre_scope is not None and hasattr(pre_scope, "close"):
+                        pre_scope.close()
+                except Exception:
+                    pass
             raise
 
         logger.debug("successfully dialed peer %s", peer_id)
@@ -1431,20 +1500,22 @@ class Swarm(Service, INetworkService):
             raise SwarmException(f"failed to upgrade mux for peer {peer_id}") from error
         except BaseException:
             # Ensure cleanup on any unexpected exception or cancellation
-            if secured_conn is not None:
+            with trio.CancelScope() as cleanup_scope:
+                cleanup_scope.shield = True
+                if secured_conn is not None:
+                    try:
+                        await secured_conn.close()
+                    except Exception:
+                        pass
                 try:
-                    await secured_conn.close()
+                    await raw_conn.close()
                 except Exception:
                     pass
-            try:
-                await raw_conn.close()
-            except Exception:
-                pass
-            try:
-                if pre_scope is not None and hasattr(pre_scope, "close"):
-                    pre_scope.close()
-            except Exception:
-                pass
+                try:
+                    if pre_scope is not None and hasattr(pre_scope, "close"):
+                        pre_scope.close()
+                except Exception:
+                    pass
             raise
 
         logger.debug("Swarm: muxer upgrade completed for peer %s", peer_id)
@@ -1585,12 +1656,8 @@ class Swarm(Service, INetworkService):
         if not existing_p2p:
             addr = Multiaddr(f"{addr}/p2p/{peer_id}")
 
-        dial_with_source = getattr(transport, "dial_with_source", None)
         try:
-            if source is not None and callable(dial_with_source):
-                raw_conn = await cast(Any, dial_with_source)(addr, source)
-            else:
-                raw_conn = await transport.dial(addr)
+            raw_conn = await self._dial_transport(transport, addr, source)
             if self.psk is not None:
                 raw_conn = new_protected_conn(raw_conn, self.psk)
         except OpenConnectionError as error:
@@ -2960,6 +3027,7 @@ class Swarm(Service, INetworkService):
                     return existing_conn  # type: ignore[return-value]
 
             self.connections[peer_id].append(swarm_conn)
+            self.dial_backoff.clear(peer_id)
 
             # Initialize health tracking for the new connection
             self.initialize_connection_health(peer_id, swarm_conn)
@@ -3029,7 +3097,8 @@ class Swarm(Service, INetworkService):
                 )
 
             logger.info(
-                "add_conn: connected notifee completed for peer=%s id(swarm_conn)=%d is_closed=%s",
+                "add_conn: connected notifee completed for peer=%s "
+                "id(swarm_conn)=%d is_closed=%s",
                 peer_id,
                 id(swarm_conn),
                 swarm_conn.event_closed.is_set(),

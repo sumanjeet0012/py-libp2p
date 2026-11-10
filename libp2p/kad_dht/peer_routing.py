@@ -6,6 +6,7 @@ to efficiently locate peers in a distributed network.
 """
 
 import logging
+import random
 
 import trio
 import varint
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 MAX_PEER_LOOKUP_ROUNDS = 20  # Maximum number of rounds in peer lookup
 MIN_PEERS_THRESHOLD = 5  # Minimum peers threshold for fallback to connected peers
+
+# Non-deterministic source for per-round candidate selection. SystemRandom so a
+# peer observing our queries cannot predict which candidates we pick next.
+_rng = random.SystemRandom()
 
 
 class PeerRouting(IPeerRouting):
@@ -310,9 +315,7 @@ class PeerRouting(IPeerRouting):
                 # Exclude self - we can't query ourselves (Kubo does the same)
                 local_id = self.host.get_id()
                 candidates = [
-                    p
-                    for p in closest_peers
-                    if p not in queried_peers and p != local_id
+                    p for p in closest_peers if p not in queried_peers and p != local_id
                 ]
                 # Draw the batch at random from the candidate window instead of
                 # always taking the strictly closest ALPHA. Every candidate is
@@ -553,6 +556,15 @@ class PeerRouting(IPeerRouting):
                                 except Exception:
                                     pass  # Skip invalid addresses
                             if addrs:
+                                from libp2p.utils.address_validation import (
+                                    is_public_or_dns_address,
+                                )
+
+                                public_addrs = [
+                                    a for a in addrs if is_public_or_dns_address(a)
+                                ]
+                                if public_addrs:
+                                    addrs = public_addrs
                                 self.host.get_peerstore().add_addrs(
                                     new_peer_id, addrs, 3600
                                 )

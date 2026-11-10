@@ -233,9 +233,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         # Keep-alive: send PING frames on idle connections (kubo parity:
         # quic-go sends a PING every 15 s and closes connections idle for 30 s).
-        keepalive_enabled = getattr(
-            self._transport._config, "KEEPALIVE_ENABLED", True
-        )
+        keepalive_enabled = getattr(self._transport._config, "KEEPALIVE_ENABLED", True)
         if not isinstance(keepalive_enabled, bool):
             keepalive_enabled = True
         keepalive_interval = getattr(
@@ -428,9 +426,17 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
                 logger.debug(f"Initiated QUIC connection to {self._remote_addr}")
 
-        except Exception as e:
-            logger.error(f"Failed to initiate connection: {e}")
-            raise QUICConnectionError(f"Connection initiation failed: {e}") from e
+        except BaseException as e:
+            if self._socket and self._owns_socket:
+                try:
+                    self._socket.close()
+                except Exception:
+                    pass
+                self._socket = None
+            if isinstance(e, Exception) and not isinstance(e, trio.Cancelled):
+                logger.error(f"Failed to initiate connection: {e}")
+                raise QUICConnectionError(f"Connection initiation failed: {e}") from e
+            raise
 
     async def connect(self, nursery: trio.Nursery) -> None:
         """
@@ -619,6 +625,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 if maintenance_count % 5 == 0:
                     try:
                         import ctypes
+
                         libc = ctypes.CDLL("libc.so.6")
                         libc.malloc_trim(0)
                     except Exception:
@@ -1257,12 +1264,11 @@ class QUICConnection(IRawConnection, IMuxedConn):
             # spawns a "ghost" inbound stream whose writes fail - aioquic may
             # have already reset the send side ("cannot call write() after
             # reset()") or dropped the stream entirely.
-            logger.debug(
-                "Ignoring late event for closed inbound stream %s", stream_id
-            )
+            logger.debug("Ignoring late event for closed inbound stream %s", stream_id)
             raise QUICStreamError(f"Closed inbound stream {stream_id}")
 
-        if stream_id not in self._quic._streams:
+        quic_streams = getattr(self._quic, "_streams", None)
+        if isinstance(quic_streams, dict) and stream_id not in quic_streams:
             # Late event for an already-discarded stream (see
             # _handle_stream_data_batch): aioquic no longer tracks it, so any
             # wrapper is a ghost whose writes fail with "Cannot send data on
@@ -1271,7 +1277,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 "Ignoring late event for discarded inbound stream %s "
                 "(aioquic no longer tracks it, %d streams left)",
                 stream_id,
-                len(self._quic._streams),
+                len(quic_streams),
             )
             raise QUICStreamError(f"Discarded inbound stream {stream_id}")
 
@@ -1554,53 +1560,56 @@ class QUICConnection(IRawConnection, IMuxedConn):
         logger.debug(f"QUIC connection terminated: {event.reason_phrase}")
 
         # Close all streams
-        for stream in list(self._streams.values()):
-            if event.error_code:
-                await stream.handle_reset(event.error_code)
-            else:
-                await stream.close()
-
-        self._streams.clear()
-        self._stream_cache.clear()  # Clear cache too
-        self._closed = True
-        self._closed_event.set()
-
-        # Release resource scope if present (mirrors close())
         try:
-            scope = getattr(self, "_resource_scope", None)
-            if scope is not None:
-                if hasattr(scope, "close"):
-                    scope.close()
-                elif hasattr(scope, "release"):
-                    scope.release()
-                elif hasattr(scope, "done"):
-                    scope.done()
+            for stream in list(self._streams.values()):
+                if event.error_code:
+                    await stream.handle_reset(event.error_code)
+                else:
+                    await stream.close()
         except Exception as e:
-            logger.debug(f"Error releasing resource scope: {e}")
+            logger.debug(f"Error resetting streams on termination: {e}")
+        finally:
+            self._streams.clear()
+            self._stream_cache.clear()  # Clear cache too
+            self._closed = True
+            self._closed_event.set()
 
-        self._stream_accept_event.set()
-        logger.debug(f"Woke up pending accept_stream() calls, {id(self)}")
-
-        # Ensure socket is closed immediately on connection termination
-        if self._socket and self._owns_socket:
+            # Release resource scope if present (mirrors close())
             try:
-                self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
+                scope = getattr(self, "_resource_scope", None)
+                if scope is not None:
+                    if hasattr(scope, "close"):
+                        scope.close()
+                    elif hasattr(scope, "release"):
+                        scope.release()
+                    elif hasattr(scope, "done"):
+                        scope.done()
+            except Exception as e:
+                logger.debug(f"Error releasing resource scope: {e}")
 
-        # Cancel background tasks
-        if hasattr(self, "_task_cancel_scopes"):
-            for s in list(self._task_cancel_scopes):
+            self._stream_accept_event.set()
+            logger.debug(f"Woke up pending accept_stream() calls, {id(self)}")
+
+            # Ensure socket is closed immediately on connection termination
+            if self._socket and self._owns_socket:
                 try:
-                    s.cancel()
+                    self._socket.close()
                 except Exception:
                     pass
-        if hasattr(self, "_cancel_scope") and self._cancel_scope is not None:
-            try:
-                self._cancel_scope.cancel()
-            except Exception:
-                pass
+                self._socket = None
+
+            # Cancel background tasks
+            if hasattr(self, "_task_cancel_scopes"):
+                for s in list(self._task_cancel_scopes):
+                    try:
+                        s.cancel()
+                    except Exception:
+                        pass
+            if hasattr(self, "_cancel_scope") and self._cancel_scope is not None:
+                try:
+                    self._cancel_scope.cancel()
+                except Exception:
+                    pass
 
         await self._notify_parent_of_termination()
 
@@ -1682,12 +1691,11 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         if stream_id in self._recently_closed_streams:
             # Late event for a stream we already handled and closed.
-            logger.debug(
-                "Ignoring late event for closed inbound stream %s", stream_id
-            )
+            logger.debug("Ignoring late event for closed inbound stream %s", stream_id)
             raise QUICStreamError(f"Closed inbound stream {stream_id}")
 
-        if stream_id not in self._quic._streams:
+        quic_streams = getattr(self._quic, "_streams", None)
+        if isinstance(quic_streams, dict) and stream_id not in quic_streams:
             # Late event for an already-discarded stream (see
             # _handle_stream_data_batch): aioquic no longer tracks it.
             logger.debug(
@@ -1772,7 +1780,8 @@ class QUICConnection(IRawConnection, IMuxedConn):
         self._maybe_send_keepalive()
 
     def _maybe_send_keepalive(self) -> None:
-        """Send a PING frame if the connection is idle past the keep-alive interval.
+        """
+        Send a PING frame if the connection is idle past the keep-alive interval.
 
         aioquic has no built-in keep-alive; quic-go (used by kubo) sends a PING
         every KeepAlivePeriod (15 s) to keep idle connections open past the
@@ -1884,173 +1893,196 @@ class QUICConnection(IRawConnection, IMuxedConn):
                     pass
         logger.debug(f"Closing QUIC connection to {self._remote_peer_id}")
 
-        try:
-            # Close all streams gracefully, but limit concurrency to prevent
-            # excessive CPU usage when many streams fail simultaneously
-            stream_close_tasks = []
-            for stream in list(self._streams.values()):
-                if stream.can_write() or stream.can_read():
-                    stream_close_tasks.append(stream.close)
-
-            if stream_close_tasks and self._nursery:
-                try:
-                    # Close streams in batches to prevent overwhelming the system
-                    # when many streams fail simultaneously (e.g., 100 streams)
-                    batch_size = 20  # Close streams in batches of 20
-                    with trio.move_on_after(self.CONNECTION_CLOSE_TIMEOUT):
-                        for i in range(0, len(stream_close_tasks), batch_size):
-                            batch = stream_close_tasks[i : i + batch_size]
-                            async with trio.open_nursery() as close_nursery:
-                                for task in batch:
-                                    close_nursery.start_soon(task)
-                except Exception as e:
-                    logger.warning(f"Error during graceful stream close: {e}")
-                    # Force reset remaining streams quickly without batching
-                    # to prevent resource leaks
-                    for stream in list(self._streams.values()):
-                        try:
-                            # Use move_on_after to prevent hanging on stuck streams
-                            with trio.move_on_after(0.1):  # 100ms per stream max
-                                await stream.reset(error_code=0)
-                        except Exception:
-                            pass
-
-            if self.on_close:
-                await self.on_close()
-
-            # Close QUIC connection
+        # Shield entire cleanup from caller cancellation so stream cleanup,
+        # callbacks, and socket close are never aborted prematurely.
+        with trio.CancelScope() as cleanup_scope:
+            cleanup_scope.shield = True
             try:
-                self._quic.close()
-            except Exception:
-                pass
+                # Close all streams gracefully, but limit concurrency to prevent
+                # excessive CPU usage when many streams fail simultaneously
+                stream_close_tasks = []
+                for stream in list(self._streams.values()):
+                    if stream.can_write() or stream.can_read():
+                        stream_close_tasks.append(stream.close)
 
-            # Best-effort transmit close frame (bounded with 0.1s timeout)
-            if self._socket:
-                try:
-                    with trio.move_on_after(0.1):
-                        await self._transmit()
-                except Exception:
-                    pass
-
-            # Guaranteed socket close
-            if self._socket and self._owns_socket:
-                try:
-                    self._socket.close()
-                except Exception:
-                    pass
-                self._socket = None
-
-            self._streams.clear()
-            self._stream_cache.clear()
-            self._stream_accept_queue.clear()
-            self._handshake_events.clear()
-            self._task_cancel_scopes.clear()
-            self._peer_certificate = None
-            self._stream_handler = None
-            self._closed_event.set()
-
-            # Immediately cancel background tasks (receiver, event loop, maintenance)
-            if hasattr(self, "_task_cancel_scopes"):
-                for s in list(self._task_cancel_scopes):
+                if stream_close_tasks and self._nursery:
                     try:
-                        s.cancel()
+                        # Close streams in batches to prevent overwhelming the system
+                        # when many streams fail simultaneously (e.g., 100 streams)
+                        batch_size = 20  # Close streams in batches of 20
+                        with trio.move_on_after(self.CONNECTION_CLOSE_TIMEOUT):
+                            for i in range(0, len(stream_close_tasks), batch_size):
+                                batch = stream_close_tasks[i : i + batch_size]
+                                async with trio.open_nursery() as close_nursery:
+                                    for task in batch:
+                                        close_nursery.start_soon(task)
+                    except Exception as e:
+                        logger.warning(f"Error during graceful stream close: {e}")
+                        # Force reset remaining streams quickly without batching
+                        # to prevent resource leaks
+                        for stream in list(self._streams.values()):
+                            try:
+                                # Use move_on_after to prevent hanging on stuck streams
+                                with trio.move_on_after(0.1):  # 100ms per stream max
+                                    await stream.reset(error_code=0)
+                            except Exception:
+                                pass
+
+                if self.on_close:
+                    try:
+                        await self.on_close()
+                    except Exception as e:
+                        logger.debug(f"Error in on_close callback: {e}")
+
+                # Close QUIC connection
+                try:
+                    self._quic.close()
+                except Exception:
+                    pass
+
+                # Best-effort transmit close frame (bounded with 0.1s timeout)
+                if self._socket:
+                    try:
+                        with trio.move_on_after(0.1):
+                            await self._transmit()
                     except Exception:
                         pass
-            if hasattr(self, "_cancel_scope") and self._cancel_scope is not None:
-                try:
-                    self._cancel_scope.cancel()
-                except Exception:
-                    pass
 
-            # Always notify parent transport and listener to remove this connection
-            # from their connection tracking dictionaries to prevent memory leaks.
-            try:
-                await self._notify_parent_of_termination()
             except Exception as e:
-                logger.debug(f"Error notifying parent of connection termination: {e}")
+                logger.error(f"Error during connection close: {e}")
+            finally:
+                # Guaranteed socket close regardless of any errors/exceptions
+                if self._socket and self._owns_socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
 
-            # Aggressively release ALL C-level state held by the aioquic
-            # QuicConnection to prevent unbounded memory growth.
-            # Without this, OpenSSL key schedules, recovery buffers, crypto
-            # streams, and TLS session state remain allocated until Python GC
-            # collects the object — which may never happen if any reference
-            # lingers in the listener/registry tracking dicts.
-            if self._quic is not None:
-                # Null out TLS context — frees OpenSSL key schedule, peer
-                # certificate chains, EC private keys, and receive buffers.
-                try:
-                    self._quic.tls = None
-                except Exception:
-                    pass
-                # Null out loss/recovery state — frees packet number space,
-                # ACK tracking, congestion controller, and pacer buffers.
-                try:
-                    self._quic._loss = None
-                except Exception:
-                    pass
-                # Clear crypto stream state — these hold bytearrays for
-                # handshake data that are never freed otherwise.
-                for attr in (
-                    "_crypto_streams",
-                    "_crypto_buffers",
-                    "_cryptos",
-                    "_cryptos_initial",
-                ):
-                    if hasattr(self._quic, attr):
+                self._streams.clear()
+                self._stream_cache.clear()  # Clear cache
+                self._closed_event.set()
+
+                # Cancel background tasks (receiver, event loop, maintenance)
+                if hasattr(self, "_task_cancel_scopes"):
+                    for s in list(self._task_cancel_scopes):
                         try:
-                            val = getattr(self._quic, attr)
-                            if hasattr(val, "clear"):
-                                val.clear()
-                            elif hasattr(val, "values"):
-                                for v in val.values():
-                                    if hasattr(v, "clear"):
-                                        v.clear()
+                            s.cancel()
                         except Exception:
                             pass
-                # Clear datagram and network path state
-                for attr in (
-                    "_events",
-                    "_streams",
-                    "_streams_finished",
-                    "_datagrams_pending",
-                    "_network_paths",
-                    "_host_cids",
-                    "_peer_cid_available",
-                ):
-                    if hasattr(self._quic, attr):
+                if hasattr(self, "_cancel_scope") and self._cancel_scope is not None:
+                    try:
+                        self._cancel_scope.cancel()
+                    except Exception:
+                        pass
+
+                # Always notify parent transport and listener to remove this connection
+                # from their connection tracking dictionaries to prevent memory leaks.
+                try:
+                    await self._notify_parent_of_termination()
+                except Exception as e:
+                    logger.debug(
+                        f"Error notifying parent of connection termination: {e}"
+                    )
+
+                # Clear internal aioquic event queues and stream maps to free memory
+                # immediately.
+                if self._quic is not None:
+                    if hasattr(self._quic, "_events"):
                         try:
-                            val = getattr(self._quic, attr)
-                            if hasattr(val, "clear"):
-                                val.clear()
+                            self._quic._events.clear()
                         except Exception:
                             pass
-                # Null the quic_logger to prevent it holding buffered log data
+                    if hasattr(self._quic, "_streams"):
+                        try:
+                            self._quic._streams.clear()
+                        except Exception:
+                            pass
+
+                logger.debug(f"QUIC connection to {self._remote_peer_id} closed")
+
+                # Release resource scope if present
                 try:
-                    self._quic._quic_logger = None
-                except Exception:
-                    pass
-                # Release the aioquic QuicConnection object entirely so
-                # Python GC can reclaim it immediately.
-                self._quic = None
+                    scope = getattr(self, "_resource_scope", None)
+                    if scope is not None:
+                        if hasattr(scope, "close"):
+                            scope.close()
+                        elif hasattr(scope, "release"):
+                            scope.release()
+                        elif hasattr(scope, "done"):
+                            scope.done()
+                        self._resource_scope = None
+                except Exception as e:
+                    logger.debug(f"Error releasing resource scope: {e}")
 
-            logger.debug(f"QUIC connection to {self._remote_peer_id} closed")
+                # Aggressively release ALL C-level state held by the aioquic
+                # QuicConnection to prevent unbounded memory growth.
+                # Without this, OpenSSL key schedules, recovery buffers, crypto
+                # streams, and TLS session state remain allocated until Python GC
+                # collects the object — which may never happen if any reference
+                # lingers in the listener/registry tracking dicts.
+                if self._quic is not None:
+                    # Null out TLS context — frees OpenSSL key schedule, peer
+                    # certificate chains, EC private keys, and receive buffers.
+                    try:
+                        self._quic.tls = None
+                    except Exception:
+                        pass
+                    # Null out loss/recovery state — frees packet number space,
+                    # ACK tracking, congestion controller, and pacer buffers.
+                    try:
+                        self._quic._loss = None
+                    except Exception:
+                        pass
+                    # Clear crypto stream state — these hold bytearrays for
+                    # handshake data that are never freed otherwise.
+                    for attr in (
+                        "_crypto_streams",
+                        "_crypto_buffers",
+                        "_cryptos",
+                        "_cryptos_initial",
+                    ):
+                        if hasattr(self._quic, attr):
+                            try:
+                                val = getattr(self._quic, attr)
+                                if hasattr(val, "clear"):
+                                    val.clear()
+                                elif hasattr(val, "values"):
+                                    for v in val.values():
+                                        if hasattr(v, "clear"):
+                                            v.clear()
+                            except Exception:
+                                pass
+                    # Clear datagram and network path state
+                    for attr in (
+                        "_events",
+                        "_streams",
+                        "_streams_finished",
+                        "_datagrams_pending",
+                        "_network_paths",
+                        "_host_cids",
+                        "_peer_cid_available",
+                    ):
+                        if hasattr(self._quic, attr):
+                            try:
+                                val = getattr(self._quic, attr)
+                                if hasattr(val, "clear"):
+                                    val.clear()
+                            except Exception:
+                                pass
+                    # Null the quic_logger to prevent it holding buffered log data
+                    try:
+                        self._quic._quic_logger = None
+                    except Exception:
+                        pass
+                    # Release the aioquic QuicConnection object entirely so
+                    # Python GC can reclaim it immediately.
+                    self._quic = None
 
-            # Release resource scope if present
-            try:
-                scope = getattr(self, "_resource_scope", None)
-                if scope is not None:
-                    if hasattr(scope, "close"):
-                        scope.close()
-                    elif hasattr(scope, "release"):
-                        scope.release()
-                    elif hasattr(scope, "done"):
-                        scope.done()
-                    self._resource_scope = None
-            except Exception as e:
-                logger.debug(f"Error releasing resource scope: {e}")
-
-        except Exception as e:
-            logger.error(f"Error during connection close: {e}")
+                self._stream_accept_queue.clear()
+                self._handshake_events.clear()
+                self._peer_certificate = None
+                self._stream_handler = None
 
     async def _notify_parent_of_termination(self) -> None:
         """
@@ -2242,7 +2274,8 @@ class QUICConnection(IRawConnection, IMuxedConn):
             self._remove_stream(int(stream_id))
 
     async def _cleanup_orphaned_streams(self) -> None:
-        """Detect and close orphaned streams that have no activity for too long.
+        """
+        Detect and close orphaned streams that have no activity for too long.
 
         Orphaned streams are streams that are open but have not had any data
         flow for ORPHANED_STREAM_TIMEOUT seconds. This handles the case where
@@ -2264,13 +2297,16 @@ class QUICConnection(IRawConnection, IMuxedConn):
                     streams_to_reset.append(stream)
                     logger.debug(
                         "Found orphaned stream %s (age=%.0fs, direction=%s)",
-                        stream.stream_id, age, stream.direction,
+                        stream.stream_id,
+                        age,
+                        stream.direction,
                     )
 
         if streams_to_reset:
             logger.warning(
                 "Resetting %d orphaned streams on connection to %s",
-                len(streams_to_reset), self._remote_peer_id,
+                len(streams_to_reset),
+                self._remote_peer_id,
             )
             for stream in streams_to_reset:
                 try:

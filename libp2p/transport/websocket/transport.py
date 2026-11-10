@@ -31,6 +31,18 @@ from .tls_config import WebSocketTLSConfig
 logger = logging.getLogger(__name__)
 
 
+def _find_ssl_error(exc: BaseException) -> ssl.SSLError | None:
+    """Return the ``ssl`` error behind ``exc``, if there is one in its chain."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
 @dataclass
 class WebsocketConfig:
     """Configuration options for WebSocket transport."""
@@ -38,6 +50,14 @@ class WebsocketConfig:
     # TLS configuration
     tls_client_config: ssl.SSLContext | None = None
     tls_server_config: ssl.SSLContext | None = None
+
+    # Dial ``wss`` without verifying the server certificate. Off by default: a
+    # ``wss`` dial with no explicit client configuration verifies against the
+    # system trust store and checks the hostname, as go-libp2p and js-libp2p do.
+    # Turn this on only for a self-signed endpoint you already trust; libp2p's
+    # own handshake still authenticates the peer inside the WebSocket, but an
+    # unverified outer TLS lets anyone on the path terminate it unnoticed.
+    insecure_skip_verify: bool = False
 
     # Advanced TLS configuration
     tls_config: WebSocketTLSConfig | None = None
@@ -377,6 +397,8 @@ def combine_configs(*configs: WebsocketConfig) -> WebsocketConfig:
             result.tls_client_config = config.tls_client_config
         if config.tls_server_config is not None:
             result.tls_server_config = config.tls_server_config
+        if config.insecure_skip_verify:
+            result.insecure_skip_verify = True
 
         # Connection settings
         if config.handshake_timeout != 15.0:  # Not default
@@ -550,6 +572,32 @@ class WebsocketTransport(ITransport):
             # Mark as initialized even if disabled so we don't check again
             self._autotls_initialized = True
 
+    def _default_client_ssl_context(self) -> ssl.SSLContext:
+        """
+        Build the TLS client context for a ``wss`` dial.
+
+        An explicit ``tls_client_config`` wins. Otherwise the context verifies
+        the server certificate against the system trust store and checks the
+        hostname, which is what go-libp2p (a zero ``tls.Config``) and js-libp2p
+        (the platform TLS stack) do. ``insecure_skip_verify`` restores the old
+        unverified behaviour for a self-signed endpoint the caller trusts.
+        """
+        if self._config.tls_client_config:
+            logger.debug("Using custom TLS client config")
+            return self._config.tls_client_config
+
+        ssl_context = ssl.create_default_context()
+        if self._config.insecure_skip_verify:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            logger.warning(
+                "Dialing wss with certificate verification disabled "
+                "(insecure_skip_verify): the outer TLS is unauthenticated"
+            )
+        else:
+            logger.debug("Using default TLS client config (system trust store)")
+        return ssl_context
+
     async def _get_ssl_context(
         self,
         peer_id: ID | None = None,
@@ -655,21 +703,12 @@ class WebsocketTransport(ITransport):
                 # Try to get SSL context from AutoTLS or advanced TLS config
                 ssl_context = await self._get_ssl_context(
                     peer_id=None,  # No peer ID for client connections
-                    sni_name=host,
+                    sni_name=proto_info.sni or host,
                     is_server=False,
                 )
 
                 if ssl_context is None:
-                    # Fall back to legacy TLS configuration
-                    if self._config.tls_client_config:
-                        ssl_context = self._config.tls_client_config
-                        logger.debug("Using custom TLS client config")
-                    else:
-                        # Create default SSL context for client
-                        ssl_context = ssl.create_default_context()
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_NONE
-                        logger.debug("Using default TLS client config (insecure)")
+                    ssl_context = self._default_client_ssl_context()
 
             # Handle proxy connections
             if final_proxy_url:
@@ -692,6 +731,11 @@ class WebsocketTransport(ITransport):
             logger.info(f"Connection established to {ws_url}")
             return conn
 
+        except OpenConnectionError:
+            # Already describes its own cause (a refused certificate, say);
+            # re-wrapping would bury it inside "Failed to connect to ...".
+            self._failed_connections += 1
+            raise
         except trio.TooSlowError as e:
             self._failed_connections += 1
             logger.error(f"Connection timeout after {self._config.handshake_timeout}s")
@@ -717,6 +761,12 @@ class WebsocketTransport(ITransport):
         port = int(proto_info.rest_multiaddr.value_for_protocol("tcp") or "80")
         protocol = "wss" if proto_info.is_wss else "ws"
         ws_url = f"{protocol}://{format_host_for_url(host)}:{port}/"
+
+        # A /tls/sni/<name>/ws address names the peer separately from the
+        # address to connect to: the socket goes to `host`, while the TLS
+        # server name and the Host header carry <name>, as in go-libp2p and
+        # js-libp2p. Without /sni/ both are `host`.
+        server_name = proto_info.sni or host
 
         logger.debug(f"WebsocketTransport.dial connecting to {ws_url}")
 
@@ -761,7 +811,7 @@ class WebsocketTransport(ITransport):
                                     stream = trio.SSLStream(
                                         stream,
                                         ssl_context,
-                                        server_hostname=host,
+                                        server_hostname=server_name,
                                         https_compatible=True,
                                     )
                                     try:
@@ -778,7 +828,9 @@ class WebsocketTransport(ITransport):
                                 # trio_websocket omits the port from the Host
                                 # header on the default ports.
                                 host_header = (
-                                    host if port in (80, 443) else f"{host}:{port}"
+                                    server_name
+                                    if port in (80, 443)
+                                    else f"{server_name}:{port}"
                                 )
                                 ws = await wrap_client_stream(
                                     conn_nursery,
@@ -835,6 +887,8 @@ class WebsocketTransport(ITransport):
         # either the connection or the error is delivered.
         with trio.fail_after(self._config.handshake_timeout):
             result = await result_recv.receive()
+        if isinstance(result, OpenConnectionError):
+            raise result
         if isinstance(result, BaseException):
             raise OpenConnectionError(f"Failed to dial {ws_url}: {result}") from result
         return result
@@ -873,6 +927,9 @@ class WebsocketTransport(ITransport):
             # Extract host and port from multiaddr
             host = extract_host_from_multiaddr(proto_info.rest_multiaddr) or "localhost"
             port = int(proto_info.rest_multiaddr.value_for_protocol("tcp") or "80")
+            # The tunnel goes to `host`; a /sni/ name is the TLS server name
+            # and the Host header, as on a direct dial.
+            server_name = proto_info.sni or host
 
             logger.debug(f"Connecting through SOCKS proxy to {host}:{port}")
 
@@ -885,6 +942,7 @@ class WebsocketTransport(ITransport):
                     host=host,
                     port=port,
                     ssl_context=ssl_context,
+                    server_hostname=server_name,
                 )
 
                 # Create our connection wrapper
@@ -927,8 +985,7 @@ class WebsocketTransport(ITransport):
         logger.debug("WebsocketTransport.dial called with %s", maddr)
 
         protocols = list(maddr.protocols())
-        dns_protocols = {"dns", "dns4", "dns6", "dnsaddr"}
-        if protocols and protocols[0].name in dns_protocols:
+        if protocols and protocols[0].name == "dnsaddr":
             resolved = await resolve_multiaddr_with_retry(
                 maddr,
                 resolver=DNSResolver(),
