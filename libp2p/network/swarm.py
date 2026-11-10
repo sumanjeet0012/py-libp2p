@@ -2232,6 +2232,10 @@ class Swarm(Service, INetworkService):
             # seconds later).
             if registered_conn is None:
                 self._inbound_limiter.release()
+                try:
+                    await read_write_closer.close()
+                except Exception:
+                    pass
 
         if registered_conn is not None:
             try:
