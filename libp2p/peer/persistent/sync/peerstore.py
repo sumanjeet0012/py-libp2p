@@ -6,7 +6,7 @@ in a datastore backend, similar to the pstoreds implementation in go-libp2p.
 All operations are purely synchronous without any async/await.
 """
 
-from collections import defaultdict
+from collections import OrderedDict
 from collections.abc import Sequence
 import logging
 import threading
@@ -69,6 +69,7 @@ class SyncPersistentPeerStore(IPeerStore):
         max_records: int = 10000,
         sync_interval: float = 1.0,
         auto_sync: bool = True,
+        max_cached_peers: int = 1000,
     ) -> None:
         """
         Initialize synchronous persistent peerstore.
@@ -78,6 +79,7 @@ class SyncPersistentPeerStore(IPeerStore):
             max_records: Maximum number of peer records to store
             sync_interval: Minimum interval between sync operations (seconds)
             auto_sync: Whether to automatically sync after writes
+            max_cached_peers: Maximum number of peer data objects to cache in memory
 
         :raises ValueError: If datastore is None or max_records is invalid
 
@@ -86,17 +88,21 @@ class SyncPersistentPeerStore(IPeerStore):
             raise ValueError("datastore cannot be None")
         if max_records <= 0:
             raise ValueError("max_records must be positive")
+        if max_cached_peers <= 0:
+            raise ValueError("max_cached_peers must be positive")
 
         self.datastore = datastore
         self.max_records = max_records
         self.sync_interval = sync_interval
         self.auto_sync = auto_sync
+        self.max_cached_peers = max_cached_peers
+        self.local_peer_id: ID | None = None
         self._last_sync = time.time()
         self._pending_sync = False
 
-        # In-memory caches for frequently accessed data
-        self.peer_data_map: dict[ID, PeerData] = defaultdict(PeerData)
-        self.peer_record_map: dict[ID, PeerRecordState] = {}
+        # In-memory LRU caches for frequently accessed data
+        self.peer_data_map: OrderedDict[ID, PeerData] = OrderedDict()
+        self.peer_record_map: OrderedDict[ID, PeerRecordState] = OrderedDict()
         self.local_peer_record: Envelope | None = None
 
         # Thread safety for concurrent access
@@ -141,76 +147,105 @@ class SyncPersistentPeerStore(IPeerStore):
         """Get datastore key for peer latency data."""
         return b"latency:" + peer_id.to_bytes()
 
+    def _enforce_peer_data_cache_limit(self) -> None:
+        """
+        Evict least-recently used peer records from memory if exceeding capacity.
+        The local peer identity is permanent and NEVER evicted.
+        """
+        while len(self.peer_data_map) > self.max_cached_peers:
+            evicted = False
+            for pid, data in list(self.peer_data_map.items()):
+                if pid == self.local_peer_id or (
+                    data is not None and data.privkey is not None
+                ):
+                    # Move local peer to MRU position so it isn't repeatedly checked
+                    self.peer_data_map.move_to_end(pid)
+                    continue
+                del self.peer_data_map[pid]
+                evicted = True
+                break
+            if not evicted:
+                break
+
+    def _enforce_peer_record_cache_limit(self) -> None:
+        """Evict least-recently used peer records from memory cache."""
+        while len(self.peer_record_map) > self.max_cached_peers:
+            self.peer_record_map.popitem(last=False)
+
     def _load_peer_data(self, peer_id: ID) -> PeerData:
         """Load peer data from datastore, creating if not exists."""
         with self._lock:
-            if peer_id not in self.peer_data_map:
-                peer_data = PeerData()
+            if peer_id in self.peer_data_map:
+                self.peer_data_map.move_to_end(peer_id)
+                return self.peer_data_map[peer_id]
 
-                try:
-                    # Load addresses
-                    addr_key = self._get_addr_key(peer_id)
-                    addr_data = self.datastore.get(addr_key)
-                    if addr_data:
-                        peer_data.addrs = deserialize_addresses(addr_data)
+            peer_data = PeerData()
 
-                    # Load keys
-                    key_key = self._get_key_key(peer_id)
-                    key_data = self.datastore.get(key_key)
-                    if key_data:
-                        keys_metadata = deserialize_metadata(key_data)
-                        if keys_metadata.get("pubkey"):
-                            peer_data.pubkey = deserialize_public_key(
-                                keys_metadata["pubkey"]
-                            )
-                        if keys_metadata.get("privkey"):
-                            peer_data.privkey = deserialize_private_key(
-                                keys_metadata["privkey"]
-                            )
+            try:
+                # Load addresses
+                addr_key = self._get_addr_key(peer_id)
+                addr_data = self.datastore.get(addr_key)
+                if addr_data:
+                    peer_data.addrs = deserialize_addresses(addr_data)
 
-                    # Load metadata
-                    metadata_key = self._get_metadata_key(peer_id)
-                    metadata_data = self.datastore.get(metadata_key)
-                    if metadata_data:
-                        metadata_bytes = deserialize_metadata(metadata_data)
-                        # Convert bytes back to appropriate types
-                        peer_data.metadata = {
-                            k: v.decode("utf-8") if isinstance(v, bytes) else v
-                            for k, v in metadata_bytes.items()
-                        }
+                # Load keys
+                key_key = self._get_key_key(peer_id)
+                key_data = self.datastore.get(key_key)
+                if key_data:
+                    keys_metadata = deserialize_metadata(key_data)
+                    if keys_metadata.get("pubkey"):
+                        peer_data.pubkey = deserialize_public_key(
+                            keys_metadata["pubkey"]
+                        )
+                    if keys_metadata.get("privkey"):
+                        peer_data.privkey = deserialize_private_key(
+                            keys_metadata["privkey"]
+                        )
 
-                    # Load protocols
-                    protocol_key = self._get_protocol_key(peer_id)
-                    protocol_data = self.datastore.get(protocol_key)
-                    if protocol_data:
-                        peer_data.protocols = deserialize_protocols(protocol_data)
+                # Load metadata
+                metadata_key = self._get_metadata_key(peer_id)
+                metadata_data = self.datastore.get(metadata_key)
+                if metadata_data:
+                    metadata_bytes = deserialize_metadata(metadata_data)
+                    # Convert bytes back to appropriate types
+                    peer_data.metadata = {
+                        k: v.decode("utf-8") if isinstance(v, bytes) else v
+                        for k, v in metadata_bytes.items()
+                    }
 
-                    # Load latency data
-                    latency_key = self._get_latency_key(peer_id)
-                    latency_data = self.datastore.get(latency_key)
-                    if latency_data:
-                        latency_ns = deserialize_latency(latency_data)
-                        # Convert nanoseconds back to seconds for latmap
-                        peer_data.latmap = latency_ns / 1_000_000_000
+                # Load protocols
+                protocol_key = self._get_protocol_key(peer_id)
+                protocol_data = self.datastore.get(protocol_key)
+                if protocol_data:
+                    peer_data.protocols = deserialize_protocols(protocol_data)
 
-                except (
-                    SerializationError,
-                    CryptographyError,
-                    KeyError,
-                    ValueError,
-                    TypeError,
-                ) as e:
-                    logger.error(f"Failed to load peer data for {peer_id}: {e}")
-                    # Continue with empty peer data
-                except Exception:
-                    logger.exception(
-                        f"Unexpected error loading peer data for {peer_id}"
-                    )
-                    # Continue with empty peer data
+                # Load latency data
+                latency_key = self._get_latency_key(peer_id)
+                latency_data = self.datastore.get(latency_key)
+                if latency_data:
+                    latency_ns = deserialize_latency(latency_data)
+                    # Convert nanoseconds back to seconds for latmap
+                    peer_data.latmap = latency_ns / 1_000_000_000
 
-                self.peer_data_map[peer_id] = peer_data
+            except (
+                SerializationError,
+                CryptographyError,
+                KeyError,
+                ValueError,
+                TypeError,
+            ) as e:
+                logger.error(f"Failed to load peer data for {peer_id}: {e}")
+                # Continue with empty peer data
+            except Exception:
+                logger.exception(f"Unexpected error loading peer data for {peer_id}")
+                # Continue with empty peer data
 
-            return self.peer_data_map[peer_id]
+            if peer_data.privkey is not None:
+                self.local_peer_id = peer_id
+
+            self.peer_data_map[peer_id] = peer_data
+            self._enforce_peer_data_cache_limit()
+            return peer_data
 
     def _save_peer_data(self, peer_id: ID, peer_data: PeerData) -> None:
         """
@@ -290,21 +325,22 @@ class SyncPersistentPeerStore(IPeerStore):
     def _load_peer_record(self, peer_id: ID) -> PeerRecordState | None:
         """Load peer record from datastore."""
         with self._lock:
-            if peer_id not in self.peer_record_map:
-                try:
-                    record_key = self._get_peer_record_key(peer_id)
-                    record_data = self.datastore.get(record_key)
-                    if record_data:
-                        record_state = deserialize_record_state(record_data)
-                        self.peer_record_map[peer_id] = record_state
-                        return record_state
-                except (SerializationError, KeyError, ValueError) as e:
-                    logger.error(f"Failed to load peer record for {peer_id}: {e}")
-                except Exception:
-                    logger.exception(
-                        f"Unexpected error loading peer record for {peer_id}"
-                    )
-            return self.peer_record_map.get(peer_id)
+            if peer_id in self.peer_record_map:
+                self.peer_record_map.move_to_end(peer_id)
+                return self.peer_record_map[peer_id]
+            try:
+                record_key = self._get_peer_record_key(peer_id)
+                record_data = self.datastore.get(record_key)
+                if record_data:
+                    record_state = deserialize_record_state(record_data)
+                    self.peer_record_map[peer_id] = record_state
+                    self._enforce_peer_record_cache_limit()
+                    return record_state
+            except (SerializationError, KeyError, ValueError) as e:
+                logger.error(f"Failed to load peer record for {peer_id}: {e}")
+            except Exception:
+                logger.exception(f"Unexpected error loading peer record for {peer_id}")
+            return None
 
     def _save_peer_record(self, peer_id: ID, record_state: PeerRecordState) -> None:
         """
@@ -320,6 +356,8 @@ class SyncPersistentPeerStore(IPeerStore):
             record_data = serialize_record_state(record_state)
             self.datastore.put(record_key, record_data)
             self.peer_record_map[peer_id] = record_state
+            self.peer_record_map.move_to_end(peer_id)
+            self._enforce_peer_record_cache_limit()
             self._maybe_sync()
         except Exception as e:
             raise PeerStoreError(f"Failed to save peer record for {peer_id}") from e
@@ -760,9 +798,12 @@ class SyncPersistentPeerStore(IPeerStore):
         """
         if ID.from_pubkey(privkey.get_public_key()) != peer_id:
             raise PeerStoreError("peer ID and privkey does not match")
+        self.local_peer_id = peer_id
         peer_data = self._load_peer_data(peer_id)
         peer_data.add_privkey(privkey)
         self._save_peer_data(peer_id, peer_data)
+        if peer_id in self.peer_data_map:
+            self.peer_data_map.move_to_end(peer_id)
 
     def privkey(self, peer_id: ID) -> PrivateKey:
         """
@@ -781,6 +822,7 @@ class SyncPersistentPeerStore(IPeerStore):
         :param peer_id: peer ID to add private key for
         :param key_pair:
         """
+        self.local_peer_id = peer_id
         self.add_pubkey(peer_id, key_pair.public_key)
         self.add_privkey(peer_id, key_pair.private_key)
 

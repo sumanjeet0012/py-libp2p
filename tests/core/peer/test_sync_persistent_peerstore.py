@@ -382,3 +382,93 @@ def test_memory_not_persistent(peer_id, addr):
     assert len(addrs) == 0
 
     peerstore2.close()
+
+
+def test_sync_peerstore_lru_cache_eviction(tmp_path):
+    """Test that SyncPersistentPeerStore bounds cache and protects local ID."""
+    from libp2p.crypto.ed25519 import create_new_key_pair
+    from libp2p.peer.persistent.datastore.sqlite_sync import SQLiteDatastoreSync
+    from libp2p.peer.persistent.sync.peerstore import SyncPersistentPeerStore
+
+    db_path = tmp_path / "lru_peerstore.db"
+    datastore = SQLiteDatastoreSync(str(db_path))
+    # Cap memory cache to 5 peers
+    store = SyncPersistentPeerStore(datastore, max_cached_peers=5)
+
+    # 1. Add local peer identity
+    local_key_pair = create_new_key_pair()
+    local_id = ID.from_pubkey(local_key_pair.public_key)
+    store.add_key_pair(local_id, local_key_pair)
+
+    assert local_id in store.peer_data_map
+    assert store.privkey(local_id) == local_key_pair.private_key
+
+    # 2. Add 10 remote peers
+    remote_peers = []
+    for i in range(10):
+        key_pair = create_new_key_pair()
+        pid = ID.from_pubkey(key_pair.public_key)
+        remote_peers.append(pid)
+        store.add_addrs(pid, [Multiaddr(f"/ip4/10.0.0.{i + 1}/tcp/4001")], ttl=3600)
+        store.add_protocols(pid, [f"/proto/{i}"])
+
+    # In-memory cache must not exceed max_cached_peers (5)
+    assert len(store.peer_data_map) == 5
+
+    # Local peer identity must NEVER be evicted
+    assert local_id in store.peer_data_map
+    assert store.privkey(local_id) == local_key_pair.private_key
+
+    # 3. Oldest evicted peers can still be retrieved (reloaded from SQLite on demand)
+    oldest_pid = remote_peers[0]
+    assert oldest_pid not in store.peer_data_map  # Was evicted from RAM
+    # Reading it should transparently load from datastore
+    addrs = store.addrs(oldest_pid)
+    assert len(addrs) == 1
+    assert str(addrs[0]) == "/ip4/10.0.0.1/tcp/4001"
+    assert "/proto/0" in store.get_protocols(oldest_pid)
+
+    # Now oldest_pid is loaded back into RAM cache
+    assert oldest_pid in store.peer_data_map
+    assert len(store.peer_data_map) == 5
+    # Local identity still preserved
+    assert local_id in store.peer_data_map
+
+    store.close()
+
+
+def test_sync_peerstore_lru_access_order():
+    """Test that accessing a peer refreshes its LRU position."""
+    from libp2p.crypto.ed25519 import create_new_key_pair
+    from libp2p.peer.persistent.datastore.memory_sync import MemoryDatastoreSync
+    from libp2p.peer.persistent.sync.peerstore import SyncPersistentPeerStore
+
+    datastore = MemoryDatastoreSync()
+    store = SyncPersistentPeerStore(datastore, max_cached_peers=3)
+
+    peers = []
+    for i in range(3):
+        kp = create_new_key_pair()
+        pid = ID.from_pubkey(kp.public_key)
+        peers.append(pid)
+        store.add_addrs(pid, [Multiaddr(f"/ip4/192.168.1.{i + 1}/tcp/4001")], ttl=3600)
+
+    # Memory cache has peers[0], peers[1], peers[2]
+    assert list(store.peer_data_map.keys()) == peers
+
+    # Access peers[0] (should move to MRU)
+    _ = store.addrs(peers[0])
+    assert list(store.peer_data_map.keys()) == [peers[1], peers[2], peers[0]]
+
+    # Add a 4th peer -> should evict peers[1] (oldest), keeping peers[0] and peers[2]
+    kp4 = create_new_key_pair()
+    pid4 = ID.from_pubkey(kp4.public_key)
+    store.add_addrs(pid4, [Multiaddr("/ip4/192.168.1.4/tcp/4001")], ttl=3600)
+
+    assert len(store.peer_data_map) == 3
+    assert peers[1] not in store.peer_data_map
+    assert peers[0] in store.peer_data_map
+    assert peers[2] in store.peer_data_map
+    assert pid4 in store.peer_data_map
+
+    store.close()
