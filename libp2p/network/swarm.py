@@ -2235,16 +2235,28 @@ class Swarm(Service, INetworkService):
 
         if registered_conn is not None:
             try:
-                await registered_conn.event_closed.wait()
+                # Wait until the connection closes or the swarm shuts down.
+                with trio.CancelScope() as scope:
+                    async with trio.open_nursery() as n:
+                        async def _wait_closed() -> None:
+                            await registered_conn.event_closed.wait()
+                            scope.cancel()
+
+                        async def _wait_mgr() -> None:
+                            await self.manager.wait_finished()
+                            scope.cancel()
+
+                        n.start_soon(_wait_closed)
+                        n.start_soon(_wait_mgr)
             finally:
                 # The connection closed (or the handler was cancelled during
                 # shutdown) — give the slot back so future inbound
                 # connections can be admitted.
                 self._inbound_limiter.release()
-            # Intentional barrier: keep handler alive so the connection
-            # handler task outlives the connection, mirroring the previous
-            # behaviour of parking on the swarm's finished event.
-            await self.manager.wait_finished()
+                try:
+                    await read_write_closer.close()
+                except Exception:
+                    pass
 
     async def _do_handle_inbound_connection(
         self,
