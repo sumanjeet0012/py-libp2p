@@ -773,3 +773,23 @@ class TestProviderStore:
                 # Should be present
                 assert len(providers) == 1
                 assert providers[0].peer_id == peer_id
+
+    def test_max_provider_keys_bounding(self):
+        """Test ProviderStore bounds total keys to MAX_PROVIDER_KEYS."""
+        mock_host = Mock()
+        mock_host.get_id.return_value = ID.from_base58("QmTest123")
+        store = ProviderStore(host=mock_host)
+        provider = PeerInfo(
+            ID.from_base58("QmPeer1"),
+            [Multiaddr("/ip4/127.0.0.1/tcp/8000")],
+        )
+
+        with patch("libp2p.kad_dht.provider_store.MAX_PROVIDER_KEYS", 5):
+            for i in range(5):
+                store.add_provider(f"key_{i}".encode(), provider)
+            assert len(store.providers) == 5
+
+            # Adding a 6th key should evict an older key and keep count at 5
+            store.add_provider(b"key_5", provider)
+            assert len(store.providers) == 5
+            assert b"key_5" in store.providers

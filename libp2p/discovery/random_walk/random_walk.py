@@ -222,9 +222,12 @@ class RandomWalk:
         )
         return result
 
-    def _get_peerstore_peers(self) -> list[PeerInfo]:
+    def _get_peerstore_peers(self, limit: int = 50) -> list[PeerInfo]:
         """
         Get peer info objects from the host's peerstore.
+
+        Args:
+            limit: Maximum number of peer infos to return (default: 50)
 
         Returns:
             List of PeerInfo objects from peerstore
@@ -232,7 +235,12 @@ class RandomWalk:
         """
         try:
             peerstore = self.host.get_peerstore()
-            peer_ids = peerstore.peers_with_addrs()
+            if hasattr(peerstore, "sample_peer_ids"):
+                peer_ids = peerstore.sample_peer_ids(limit=limit, random_order=True)
+            elif hasattr(peerstore, "valid_peer_ids"):
+                peer_ids = peerstore.valid_peer_ids()[:limit]
+            else:
+                peer_ids = peerstore.peers_with_addrs()[:limit]
 
             peer_infos = []
             for peer_id in peer_ids:
@@ -245,6 +253,8 @@ class RandomWalk:
                     if peer_info and peer_info.addrs:
                         if self._has_compatible_addresses(peer_info):
                             peer_infos.append(peer_info)
+                            if len(peer_infos) >= limit:
+                                break
                 except Exception as e:
                     logger.debug(f"Error getting peer info for {peer_id}: {e}")
 

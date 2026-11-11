@@ -41,6 +41,7 @@ from .common import (
     ALPHA,
     BUCKET_SIZE,
     MAX_DHT_MESSAGE_SIZE,
+    MAX_PROVIDER_KEYS,
     PROTOCOL_ID,
     QUERY_TIMEOUT,
 )
@@ -612,6 +613,18 @@ class ProviderStore:
             logger.debug("Skipping add_provider with invalid PeerInfo")
             return
 
+        # Cap total keys in provider store to prevent unbounded memory growth
+        if key not in self.providers and len(self.providers) >= MAX_PROVIDER_KEYS:
+            # Evict the oldest non-locally-provided key
+            evicted_key = None
+            for k in self.providers:
+                if k not in self.providing_keys:
+                    evicted_key = k
+                    break
+            if evicted_key is not None:
+                del self.providers[evicted_key]
+                self._last_republish.pop(evicted_key, None)
+
         # Initialize providers for this key if needed
         if key not in self.providers:
             self.providers[key] = {}
@@ -709,7 +722,21 @@ class ProviderStore:
         # Remove empty keys
         for key in expired_keys:
             del self.providers[key]
+            self._last_republish.pop(key, None)
             logger.debug(f"Removed key with no providers: {key.hex()}")
+
+        # Enforce max keys during periodic cleanup
+        while len(self.providers) > MAX_PROVIDER_KEYS:
+            evicted = False
+            for k in list(self.providers.keys()):
+                if k not in self.providing_keys:
+                    del self.providers[k]
+                    self._last_republish.pop(k, None)
+                    evicted = True
+                    removed_any = True
+                    break
+            if not evicted:
+                break
 
         if expired_keys or removed_any:
             self._save()

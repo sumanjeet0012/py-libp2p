@@ -631,6 +631,9 @@ class QUICListener(IListener):
                 f"{destination_connection_id.hex()}"
             )
 
+            initial_dcid = packet_info.destination_cid
+            self._initial_dcid_by_quic_id[id(quic_conn)] = initial_dcid
+
             # Store connection mapping using our generated Connection ID
             # Initial Connection ID has sequence number 0
             sequence = 0
@@ -638,17 +641,23 @@ class QUICListener(IListener):
                 destination_connection_id, sequence
             )
             await self._registry.register_pending(
-                destination_connection_id, quic_conn, addr, sequence
+                destination_connection_id,
+                quic_conn,
+                addr,
+                sequence,
+                initial_dcid=initial_dcid,
             )
             self._pending_cid_by_quic_id[id(quic_conn)] = destination_connection_id
 
             # Also register the initial destination Connection ID (from client)
             # in _initial_connection_ids
             # This allows proper routing of initial packets (inspired by quinn)
-            initial_dcid = packet_info.destination_cid
-            self._initial_dcid_by_quic_id[id(quic_conn)] = initial_dcid
             await self._registry.register_initial_connection_id(
-                initial_dcid, quic_conn, addr, sequence
+                initial_dcid,
+                quic_conn,
+                addr,
+                sequence,
+                host_cid=destination_connection_id,
             )
 
             # Process initial packet. Since we use ServerQuicConnection, the
@@ -670,6 +679,24 @@ class QUICListener(IListener):
         except Exception as e:
             logger.error(f"Error handling new connection from {addr}: {e}")
             self._stats["connections_rejected"] += 1
+            if quic_conn is not None:
+                quic_key = id(quic_conn)
+                self._pending_cid_by_quic_id.pop(quic_key, None)
+                self._initial_dcid_by_quic_id.pop(quic_key, None)
+                try:
+                    await self._registry.remove_pending_connection(
+                        destination_connection_id
+                    )
+                except Exception:
+                    pass
+                if initial_dcid is not None:
+                    try:
+                        await self._registry.remove_initial_connection_id(initial_dcid)
+                    except Exception:
+                        pass
+                from .connection_id_registry import _purge_quic_conn
+
+                _purge_quic_conn(quic_conn)
             return None
 
     async def _handle_short_header_packet(
@@ -990,6 +1017,7 @@ class QUICListener(IListener):
         async with self._promotion_lock:
             self._conn_by_quic_id.pop(quic_key, None)
             self._pending_cid_by_quic_id.pop(quic_key, None)
+            self._initial_dcid_by_quic_id.pop(quic_key, None)
             self._handler_invoked_quic_ids.discard(quic_key)
 
     async def _promote_pending_connection(
@@ -1096,6 +1124,8 @@ class QUICListener(IListener):
                         )
                         self._stats["connections_rejected"] += 1
                         await connection.close()
+                        await self._cleanup_promotion_lock(quic_key)
+                        await self._cleanup_quic_tracking(quic_key)
                         return
 
                 if self._nursery:
@@ -1122,6 +1152,8 @@ class QUICListener(IListener):
                         )
                         self._stats["connections_rejected"] += 1
                         await connection.close()
+                        await self._cleanup_promotion_lock(quic_key)
+                        await self._cleanup_quic_tracking(quic_key)
                         return
 
                 # Note: connect() already starts background tasks,
@@ -1410,8 +1442,12 @@ class QUICListener(IListener):
                             qid
                             for qid, cid in self._pending_cid_by_quic_id.items()
                             if cid in stale_set
+                        ] + [
+                            qid
+                            for qid, dcid in self._initial_dcid_by_quic_id.items()
+                            if dcid in stale_set
                         ]
-                        for qid in stale_qids:
+                        for qid in set(stale_qids):
                             self._pending_cid_by_quic_id.pop(qid, None)
                             self._handler_invoked_quic_ids.discard(qid)
                             init_dcid = self._initial_dcid_by_quic_id.pop(qid, None)
@@ -1425,6 +1461,26 @@ class QUICListener(IListener):
                                     await conn.close()
                                 except Exception:
                                     pass
+
+                    # Reconcile orphan pending tracking entries evicted from registry
+                    all_pending = set(await self._registry.get_all_pending_cids())
+                    orphan_qids = [
+                        qid
+                        for qid, cid in self._pending_cid_by_quic_id.items()
+                        if cid not in all_pending
+                    ]
+                    for qid in orphan_qids:
+                        self._pending_cid_by_quic_id.pop(qid, None)
+                        self._handler_invoked_quic_ids.discard(qid)
+                        init_dcid = self._initial_dcid_by_quic_id.pop(qid, None)
+                        if init_dcid:
+                            await self._registry.remove_initial_connection_id(init_dcid)
+                        conn = self._conn_by_quic_id.pop(qid, None)
+                        if conn:
+                            try:
+                                await conn.close()
+                            except Exception:
+                                pass
 
                     active_keys = set(self._pending_cid_by_quic_id.keys()) | set(
                         self._conn_by_quic_id.keys()

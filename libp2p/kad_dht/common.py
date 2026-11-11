@@ -18,6 +18,7 @@ MAX_RECORD_AGE = 48 * 60 * 60  # 48 hours in seconds (go-libp2p default)
 MAX_RECORD_SIZE = 1024 * 1024  # 1MB max record size
 MAX_PROVIDERS_PER_MSG = 20  # Max provider records per ADD_PROVIDER message
 MAX_VALUE_STORE_SIZE = 50000  # Max entries in value store
+MAX_PROVIDER_KEYS = 2000  # Max unique content keys in provider store to bound RAM
 
 TTL = DEFAULT_TTL = 24 * 60 * 60  # 24 hours in seconds
 
