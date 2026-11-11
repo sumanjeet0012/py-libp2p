@@ -1435,6 +1435,9 @@ class QUICListener(IListener):
             while self._listening:
                 await trio.sleep(10.0)
                 stale_cids = await self._registry.cleanup_stale_pending(max_age=15.0)
+                init_dcids_to_remove = []
+                conns_to_close = []
+
                 async with self._promotion_lock:
                     if stale_cids:
                         stale_set = set(stale_cids)
@@ -1452,15 +1455,10 @@ class QUICListener(IListener):
                             self._handler_invoked_quic_ids.discard(qid)
                             init_dcid = self._initial_dcid_by_quic_id.pop(qid, None)
                             if init_dcid:
-                                await self._registry.remove_initial_connection_id(
-                                    init_dcid
-                                )
+                                init_dcids_to_remove.append(init_dcid)
                             conn = self._conn_by_quic_id.pop(qid, None)
                             if conn:
-                                try:
-                                    await conn.close()
-                                except Exception:
-                                    pass
+                                conns_to_close.append(conn)
 
                     # Reconcile orphan pending tracking entries evicted from registry
                     all_pending = set(await self._registry.get_all_pending_cids())
@@ -1474,13 +1472,10 @@ class QUICListener(IListener):
                         self._handler_invoked_quic_ids.discard(qid)
                         init_dcid = self._initial_dcid_by_quic_id.pop(qid, None)
                         if init_dcid:
-                            await self._registry.remove_initial_connection_id(init_dcid)
+                            init_dcids_to_remove.append(init_dcid)
                         conn = self._conn_by_quic_id.pop(qid, None)
                         if conn:
-                            try:
-                                await conn.close()
-                            except Exception:
-                                pass
+                            conns_to_close.append(conn)
 
                     active_keys = set(self._pending_cid_by_quic_id.keys()) | set(
                         self._conn_by_quic_id.keys()
@@ -1490,6 +1485,18 @@ class QUICListener(IListener):
                     ]
                     for k in stale_keys:
                         self._promotion_locks.pop(k, None)
+
+                # Perform registry removal and connection close outside promotion lock
+                for init_dcid in init_dcids_to_remove:
+                    try:
+                        await self._registry.remove_initial_connection_id(init_dcid)
+                    except Exception:
+                        pass
+                for conn in conns_to_close:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
         except trio.Cancelled:
             pass
 
