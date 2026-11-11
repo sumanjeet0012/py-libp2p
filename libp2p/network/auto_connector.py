@@ -187,7 +187,7 @@ class AutoConnector:
         self._quarantine_until: dict[ID, float] = {}
         self._quarantine_count: dict[ID, int] = {}
         self._last_quarantine_at: dict[ID, float] = {}
-        self._quick_death_threshold = 60.0  # lifespan below this = eviction
+        self._quick_death_threshold = 45.0  # lifespan below this = eviction
         self._quick_death_limit = 3  # evictions before quarantining
         self._quarantine_base = 90.0  # 90 s, doubles per offense
         self._quarantine_max = 1800.0  # cap at 30 minutes
@@ -316,6 +316,7 @@ class AutoConnector:
             What caused this cycle: ``"periodic"`` (timer tick) or
             ``"disconnect"`` (event-driven replenish).  Stored in the
             cycle stats for observability.
+
         """
         if not self._started:
             return
@@ -473,6 +474,13 @@ class AutoConnector:
                                     )
                                     self._last_connect_attempt.pop(peer_id, None)
                                     self._failure_counts.pop(peer_id, None)
+                                    host = getattr(self.swarm, "host", None)
+                                    if host is not None and hasattr(
+                                        host, "_schedule_identify"
+                                    ):
+                                        host._schedule_identify(
+                                            peer_id, reason="autoconnect"
+                                        )
                                 else:
                                     outcome = "timeout"
                                     logger.debug(f"Dial to {peer_id} timed out")
@@ -487,6 +495,13 @@ class AutoConnector:
                                 # re-dialable if it disconnects later
                                 self._last_connect_attempt.pop(peer_id, None)
                                 self._failure_counts.pop(peer_id, None)
+                                host = getattr(self.swarm, "host", None)
+                                if host is not None and hasattr(
+                                    host, "_schedule_identify"
+                                ):
+                                    host._schedule_identify(
+                                        peer_id, reason="autoconnect"
+                                    )
                         except Exception as e:
                             logger.debug(f"Failed to auto-connect to {peer_id}: {e}")
                             self._failure_counts[peer_id] = (
@@ -673,9 +688,7 @@ class AutoConnector:
 
         if self._quarantine_until:
             expired = [
-                pid
-                for pid, until in self._quarantine_until.items()
-                if now - until > 0
+                pid for pid, until in self._quarantine_until.items() if now - until > 0
             ]
             for pid in expired:
                 self._quarantine_until.pop(pid, None)
@@ -707,8 +720,13 @@ class AutoConnector:
         """
         candidates = []
 
-        # Get all peers from peerstore
-        all_peers = self.swarm.peerstore.peer_ids()
+        # Get all peers from peerstore (sample bounded query when available)
+        if hasattr(self.swarm.peerstore, "sample_peer_ids"):
+            all_peers = self.swarm.peerstore.sample_peer_ids(
+                limit=200, random_order=True
+            )
+        else:
+            all_peers = self.swarm.peerstore.peer_ids()
 
         # Get currently connected peers
         connected_peers = set(self.swarm.connections.keys())

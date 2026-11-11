@@ -804,11 +804,32 @@ class GossipSub(IPubsubRouter, Service):
         )
 
     def _notify_mesh_peer_added(self, peer_id: ID, topic: str) -> None:
-        """Wake any ``wait_for_mesh`` waiter for this peer/topic."""
+        """
+        Wake any ``wait_for_mesh`` waiter for this peer/topic and tag peer.
+        """
         key = (peer_id, topic)
         event = self._mesh_peer_events.pop(key, None)
         if event is not None:
             event.set()
+        try:
+            if hasattr(self, "host") and self.host:
+                if hasattr(self.host, "conn_manager"):
+                    self.host.conn_manager.tag_peer(peer_id, f"pubsub:{topic}", 100)
+                elif hasattr(self.host, "get_network"):
+                    self.host.get_network().tag_peer(peer_id, f"pubsub:{topic}", 100)
+        except Exception:
+            pass
+
+    def _notify_mesh_peer_removed(self, peer_id: ID, topic: str) -> None:
+        """Untag peer when pruned or removed from mesh."""
+        try:
+            if hasattr(self, "host") and self.host:
+                if hasattr(self.host, "conn_manager"):
+                    self.host.conn_manager.untag_peer(peer_id, f"pubsub:{topic}")
+                elif hasattr(self.host, "get_network"):
+                    self.host.get_network().untag_peer(peer_id, f"pubsub:{topic}")
+        except Exception:
+            pass
 
     async def wait_for_mesh(
         self, peer_id: ID, topic_id: str, timeout: float = 5.0
@@ -885,7 +906,9 @@ class GossipSub(IPubsubRouter, Service):
         logger.debug("removing peer %s", peer_id)
 
         for topic in self.mesh:
-            self.mesh[topic].discard(peer_id)
+            if peer_id in self.mesh[topic]:
+                self.mesh[topic].discard(peer_id)
+                self._notify_mesh_peer_removed(peer_id, topic)
         for topic in self.fanout:
             self.fanout[topic].discard(peer_id)
 
@@ -1235,6 +1258,7 @@ class GossipSub(IPubsubRouter, Service):
             # Add backoff BEFORE emitting PRUNE to avoid races where a GRAFT
             # could be processed before the backoff is recorded locally.
             self._add_back_off(peer, topic, True)
+            self._notify_mesh_peer_removed(peer, topic)
             await self.emit_prune(topic, peer, self.do_px, True)
 
         # Forget mesh[topic]
@@ -1442,6 +1466,7 @@ class GossipSub(IPubsubRouter, Service):
                 for peer in peers_to_remove:
                     # Remove peer from mesh[topic]
                     self.mesh[topic].discard(peer)
+                    self._notify_mesh_peer_removed(peer, topic)
                     if self.scorer is not None:
                         self.scorer.on_leave_mesh(peer, topic)
 
@@ -1910,6 +1935,7 @@ class GossipSub(IPubsubRouter, Service):
         # Remove sender from mesh if topic exists in mesh
         if topic in self.mesh:
             self.mesh[topic].discard(sender_peer_id)
+            self._notify_mesh_peer_removed(sender_peer_id, topic)
             if self.scorer is not None:
                 self.scorer.on_leave_mesh(sender_peer_id, topic)
 
@@ -3461,6 +3487,7 @@ class GossipSub(IPubsubRouter, Service):
 
         # Perform replacement: mutate mesh and emit PRUNE/GRAFT
         self.mesh[topic].discard(worst_peer)
+        self._notify_mesh_peer_removed(worst_peer, topic)
         self.mesh[topic].add(best_replacement)
         self._notify_mesh_peer_added(best_replacement, topic)
 
@@ -3492,6 +3519,7 @@ class GossipSub(IPubsubRouter, Service):
             self.mesh[topic].add(worst_peer)
             self._notify_mesh_peer_added(worst_peer, topic)
             self.mesh[topic].discard(best_replacement)
+            self._notify_mesh_peer_removed(best_replacement, topic)
             if self.scorer is not None:
                 self.scorer.on_join_mesh(worst_peer, topic)
                 self.scorer.on_leave_mesh(best_replacement, topic)

@@ -187,6 +187,34 @@ class SQLiteDatastoreSync(IBatchingDatastoreSync):
             for row in cursor:
                 yield row[0], row[1]
 
+    def query_keys(
+        self, prefix: bytes = b"", limit: int | None = None, random_order: bool = False
+    ) -> Iterator[bytes]:
+        """
+        Query only keys (omitting value blobs) with optional prefix,
+        random ordering, and limit. Significantly faster and lighter on memory
+        than query().
+        """
+        self._ensure_connection()
+        if self.connection is None:
+            raise ValueError("SQLite connection is not initialized")
+
+        with self._lock:
+            cursor = self.connection.cursor()
+            order_clause = " ORDER BY RANDOM()" if random_order else ""
+            limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
+            if prefix:
+                query = (
+                    "SELECT key FROM datastore WHERE substr(key, 1, ?) = ?"
+                    f"{order_clause}{limit_clause}"
+                )
+                cursor.execute(query, (len(prefix), prefix))
+            else:
+                cursor.execute(f"SELECT key FROM datastore{order_clause}{limit_clause}")
+
+            for row in cursor:
+                yield row[0]
+
     def batch(self) -> IBatchSync:
         """Create a new batch for atomic operations."""
         self._ensure_connection()

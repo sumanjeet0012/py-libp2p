@@ -222,6 +222,13 @@ class KBucket:
             # If bucket has space, add the peer
             if len(self.peers) < self.bucket_size:
                 self.peers[peer_id] = (peer_info, current_time)
+                try:
+                    if hasattr(self.host, "conn_manager"):
+                        self.host.conn_manager.tag_peer(peer_id, "dht", 100)
+                    elif hasattr(self.host, "get_network"):
+                        self.host.get_network().tag_peer(peer_id, "dht", 100)
+                except Exception:
+                    pass
                 return True
 
             # If bucket is full, we need to replace the least-recently seen peer
@@ -251,8 +258,22 @@ class KBucket:
             )
             if oldest_peer_id in self.peers:
                 del self.peers[oldest_peer_id]
+                try:
+                    if hasattr(self.host, "conn_manager"):
+                        self.host.conn_manager.untag_peer(oldest_peer_id, "dht")
+                    elif hasattr(self.host, "get_network"):
+                        self.host.get_network().untag_peer(oldest_peer_id, "dht")
+                except Exception:
+                    pass
 
             self.peers[peer_id] = (peer_info, current_time)
+            try:
+                if hasattr(self.host, "conn_manager"):
+                    self.host.conn_manager.tag_peer(peer_id, "dht", 100)
+                elif hasattr(self.host, "get_network"):
+                    self.host.get_network().tag_peer(peer_id, "dht", 100)
+            except Exception:
+                pass
             return True
 
     def _peers_in_subnet(self, subnet: str) -> int:
@@ -271,6 +292,13 @@ class KBucket:
         """
         if peer_id in self.peers:
             del self.peers[peer_id]
+            try:
+                if hasattr(self.host, "conn_manager"):
+                    self.host.conn_manager.untag_peer(peer_id, "dht")
+                elif hasattr(self.host, "get_network"):
+                    self.host.get_network().untag_peer(peer_id, "dht")
+            except Exception:
+                pass
             return True
         return False
 

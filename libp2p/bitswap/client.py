@@ -259,7 +259,9 @@ class BitswapClient(INotifee):
         """No-op — Bitswap does not track stream close events."""
 
     async def connected(self, network: Any, conn: Any) -> None:
-        """Send any live broadcast wants to a newly connected peer."""
+        """
+        Send live broadcast wants or initial wantlist hello to newly connected peer.
+        """
         peer_id = None
         try:
             if hasattr(conn, "muxed_conn") and conn.muxed_conn is not None:
@@ -271,24 +273,57 @@ class BitswapClient(INotifee):
         except Exception:
             return
 
-        if peer_id is None or not self._broadcast_wants:
+        if peer_id is None:
             return
 
-        sent = self._wants_sent_to_peer.setdefault(peer_id, set())
-        unsent = [c for c in self._broadcast_wants if c not in sent]
-        if not unsent:
-            return
-
-        logger.info(
-            f"New peer {peer_id}: sending {len(unsent)} live broadcast wants"
-        )
+        # Tag peer with bitswap weight
         try:
-            if self._nursery:
-                self._nursery.start_soon(self._send_wantlist_to_peer, peer_id, unsent)
-            else:
-                await self._send_wantlist_to_peer(peer_id, unsent)
+            if hasattr(self.host, "conn_manager"):
+                self.host.conn_manager.tag_peer(peer_id, "bitswap", 50)
+            elif hasattr(self.host, "get_network"):
+                self.host.get_network().tag_peer(peer_id, "bitswap", 50)
+        except Exception:
+            pass
+
+        if self._broadcast_wants:
+            sent = self._wants_sent_to_peer.setdefault(peer_id, set())
+            unsent = [c for c in self._broadcast_wants if c not in sent]
+            if not unsent:
+                return
+
+            logger.info(
+                f"New peer {peer_id}: sending {len(unsent)} live broadcast wants"
+            )
+            try:
+                if self._nursery:
+                    self._nursery.start_soon(
+                        self._send_wantlist_to_peer, peer_id, unsent
+                    )
+                else:
+                    await self._send_wantlist_to_peer(peer_id, unsent)
+            except Exception as e:
+                logger.debug(f"Failed to catch up peer {peer_id}: {e}")
+        elif self._started:
+            # Send initial empty full wantlist hello to establish Bitswap session
+            try:
+                if self._nursery:
+                    self._nursery.start_soon(self._send_initial_wantlist_hello, peer_id)
+                else:
+                    await self._send_initial_wantlist_hello(peer_id)
+            except Exception as e:
+                logger.debug(f"Failed to send initial wantlist hello to {peer_id}: {e}")
+
+    async def _send_initial_wantlist_hello(self, peer_id: PeerID) -> bool:
+        """Send an initial empty full wantlist to a newly connected peer."""
+        try:
+            msg_queue = self.get_or_create_message_queue(peer_id)
+            msg_queue.add_wants([], want_infos={}, full_wantlist=True)
+            if not msg_queue._started:
+                return await msg_queue.flush()
+            return True
         except Exception as e:
-            logger.debug(f"Failed to catch up peer {peer_id}: {e}")
+            logger.debug(f"Failed to send initial wantlist hello to {peer_id}: {e}")
+            return False
 
     async def disconnected(self, network: Any, conn: Any) -> None:
         """
@@ -334,6 +369,14 @@ class BitswapClient(INotifee):
         wantlists, negotiated protocols, presence and peer stats for every
         peer they have ever talked to.
         """
+        try:
+            if hasattr(self.host, "conn_manager"):
+                self.host.conn_manager.untag_peer(peer_id, "bitswap")
+            elif hasattr(self.host, "get_network"):
+                self.host.get_network().untag_peer(peer_id, "bitswap")
+        except Exception:
+            pass
+
         self._peer_wantlists.pop(peer_id, None)
         self._peer_protocols.pop(peer_id, None)
         self._peer_pending_bytes.pop(peer_id, None)
@@ -343,7 +386,6 @@ class BitswapClient(INotifee):
         queue = self._message_queues.pop(peer_id, None)
         if queue is not None and self._nursery is not None:
             self._nursery.start_soon(queue.stop)
-        logger.debug(f"Cleaned up per-peer state for {peer_id}")
         logger.debug(f"Cleaned up per-peer state for {peer_id}")
 
     def new_session(self) -> BitswapSession:
@@ -573,7 +615,8 @@ class BitswapClient(INotifee):
             return False
 
     async def _broadcast_wantlist(self, cids: list[CIDObject]) -> None:
-        """Broadcast wantlist to all connected peers (go-libp2p semantics).
+        """
+        Broadcast wantlist to all connected peers (go-libp2p semantics).
 
         Sends to every connected peer that has not already received the want
         (per-peer tracking), so re-broadcasts only reach peers that are still
@@ -586,10 +629,7 @@ class BitswapClient(INotifee):
 
         peers = list(self.host.get_network().connections.keys())
 
-        if (
-            self.max_broadcast_peers >= 0
-            and len(peers) > self.max_broadcast_peers
-        ):
+        if self.max_broadcast_peers >= 0 and len(peers) > self.max_broadcast_peers:
             start = self._broadcast_cursor % len(peers)
             peers = peers[start:] + peers[:start]
             peers = peers[: self.max_broadcast_peers]
@@ -606,7 +646,8 @@ class BitswapClient(INotifee):
                 await self._send_wantlist_to_peer(peer_id, unsent)
 
     async def _broadcast_cancel(self, cid: CIDObject) -> None:
-        """Broadcast a cancel message to all connected peers via MessageQueue.
+        """
+        Broadcast a cancel message to all connected peers via MessageQueue.
 
         Also forget the cancelled CID everywhere so a future want for it is
         re-sent (mirrors go-libp2p's broadcast-cancel bookkeeping).
@@ -804,7 +845,6 @@ class BitswapClient(INotifee):
                 await stream.close()
             except Exception as e:
                 logger.debug(f"Error closing stream from {peer_id}: {e}")
-
 
     async def _process_message(
         self, msg: Message, peer_id: PeerID, stream: INetStream

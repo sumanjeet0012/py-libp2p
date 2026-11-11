@@ -209,7 +209,8 @@ class BitswapMessageQueue:
         )
 
     async def flush(self) -> bool:
-        """Snapshot, drain, and send all pending items over the stream.
+        """
+        Snapshot, drain, and send all pending items over the stream.
 
         Returns True when the payload was handed to the transport. On failure
         the drained items are requeued, so a transient dial or stream error
@@ -282,7 +283,7 @@ class BitswapMessageQueue:
                     self._pending_presences[cid] = has_block
                 self._pending_blocks_v100 = blocks_v100 + self._pending_blocks_v100
                 self._pending_blocks_v110 = blocks_v110 + self._pending_blocks_v110
-                if full_wantlist:
+                if full_wantlist and (wants or cancels or presences):
                     self._full_wantlist = True
         return ok
 
@@ -294,7 +295,8 @@ class BitswapMessageQueue:
         blocks_v110: list[tuple[bytes, bytes]],
         full_wantlist: bool,
     ) -> bool:
-        """Send all batched messages over the reused stream.
+        """
+        Send all batched messages over the reused stream.
 
         Returns False (without sending) if no stream can be opened or a write
         fails; the caller requeues the payload for a later retry.

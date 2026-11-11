@@ -236,7 +236,6 @@ class PingService:
                 if hasattr(stream, "is_closed") and stream.is_closed():  # type: ignore[attr-defined]
                     needs_new = True
                 elif hasattr(stream, "_state"):
-                    from libp2p.network.stream.exceptions import StreamState
                     if getattr(stream._state, "value", None) == "RESET":
                         needs_new = True
             if needs_new:

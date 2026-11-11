@@ -135,6 +135,7 @@ class QUICListener(IListener):
         self._promotion_locks: dict[int, trio.Lock] = {}
         self._conn_by_quic_id: dict[int, QUICConnection] = {}
         self._pending_cid_by_quic_id: dict[int, bytes] = {}
+        self._initial_dcid_by_quic_id: dict[int, bytes] = {}
         self._handler_invoked_quic_ids: set[int] = set()
 
         # Performance tracking
@@ -645,6 +646,7 @@ class QUICListener(IListener):
             # in _initial_connection_ids
             # This allows proper routing of initial packets (inspired by quinn)
             initial_dcid = packet_info.destination_cid
+            self._initial_dcid_by_quic_id[id(quic_conn)] = initial_dcid
             await self._registry.register_initial_connection_id(
                 initial_dcid, quic_conn, addr, sequence
             )
@@ -1074,6 +1076,11 @@ class QUICListener(IListener):
                         destination_connection_id, connection, addr
                     )
 
+                # Remove initial DCID since handshake is promoted
+                init_dcid = self._initial_dcid_by_quic_id.pop(quic_key, None)
+                if init_dcid:
+                    await self._registry.remove_initial_connection_id(init_dcid)
+
                 # Belt-and-suspenders: reject inbound connections that have no
                 # peer certificate before connect() and the application callback.
                 # Must run before connect(), which also verifies identity and would
@@ -1407,6 +1414,17 @@ class QUICListener(IListener):
                         for qid in stale_qids:
                             self._pending_cid_by_quic_id.pop(qid, None)
                             self._handler_invoked_quic_ids.discard(qid)
+                            init_dcid = self._initial_dcid_by_quic_id.pop(qid, None)
+                            if init_dcid:
+                                await self._registry.remove_initial_connection_id(
+                                    init_dcid
+                                )
+                            conn = self._conn_by_quic_id.pop(qid, None)
+                            if conn:
+                                try:
+                                    await conn.close()
+                                except Exception:
+                                    pass
 
                     active_keys = set(self._pending_cid_by_quic_id.keys()) | set(
                         self._conn_by_quic_id.keys()

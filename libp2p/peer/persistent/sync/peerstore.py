@@ -456,6 +456,52 @@ class SyncPersistentPeerStore(IPeerStore):
 
         return list(peer_ids)
 
+    def sample_peer_ids(self, limit: int = 150, random_order: bool = True) -> list[ID]:
+        """
+        Return a bounded sample of peer IDs from the datastore and memory cache.
+        Does not perform a full table scan or deserialize value blobs.
+        """
+        sampled_peer_ids: set[ID] = set()
+
+        # Check memory cache first
+        with self._lock:
+            for pid in list(self.peer_data_map.keys()):
+                if self.local_peer_id and pid == self.local_peer_id:
+                    continue
+                sampled_peer_ids.add(pid)
+                if len(sampled_peer_ids) >= limit:
+                    break
+
+        if len(sampled_peer_ids) >= limit:
+            return list(sampled_peer_ids)
+
+        needed = limit - len(sampled_peer_ids)
+        try:
+            if hasattr(self.datastore, "query_keys"):
+                key_iter = self.datastore.query_keys(
+                    self.ADDR_PREFIX, limit=needed * 3, random_order=random_order
+                )
+            else:
+                key_iter = (k for k, _ in self.datastore.query(self.ADDR_PREFIX))
+
+            prefix_len = len(self.ADDR_PREFIX)
+            for key in key_iter:
+                if key.startswith(self.ADDR_PREFIX):
+                    peer_id_bytes = key[prefix_len:]
+                    try:
+                        peer_id = ID(peer_id_bytes)
+                        if self.local_peer_id and peer_id == self.local_peer_id:
+                            continue
+                        sampled_peer_ids.add(peer_id)
+                        if len(sampled_peer_ids) >= limit:
+                            break
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"Failed to sample peer IDs: {e}")
+
+        return list(sampled_peer_ids)
+
     def has_peer(self, peer_id: ID) -> bool:
         """
         Return True if the peer is known to this store (memory or datastore).

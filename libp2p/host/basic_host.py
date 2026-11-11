@@ -306,6 +306,8 @@ class BasicHost(IHost):
             ``announce_addrs`` / ``addrs_factory``.
         """
         self._network = network
+        if not hasattr(self._network, "host"):
+            setattr(self._network, "host", self)
         self._network.set_stream_handler(self._swarm_stream_handler)
         self.peerstore = self._network.peerstore
 

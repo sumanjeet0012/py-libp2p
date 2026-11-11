@@ -853,6 +853,16 @@ class ConnectionIDRegistry:
             self._pending.pop(connection_id, None)
             self._pending_created_at.pop(connection_id, None)
 
+            # Sweep any initial CIDs pointing to this connection's quic_conn
+            quic_conn = getattr(connection, "quic_connection", None)
+            if quic_conn is not None:
+                for k, v in list(self._initial_connection_ids.items()):
+                    if v is quic_conn:
+                        self._initial_connection_ids.pop(k, None)
+                        self._pending_created_at.pop(k, None)
+                        self._connection_id_to_addr.pop(k, None)
+                        self._connection_id_sequences.pop(k, None)
+
             # Add to established (may already exist, that's OK)
             if connection_id in self._connections:
                 logger.warning(
@@ -1075,13 +1085,31 @@ class ConnectionIDRegistry:
                 self._connection_sequence_counters.pop(cid, None)
 
             # Sweep any orphan initial_connection_ids pointing to stale connections
-            if stale_conns:
-                for k, v in list(self._initial_connection_ids.items()):
-                    if v in stale_conns:
-                        self._initial_connection_ids.pop(k, None)
-                        self._pending_created_at.pop(k, None)
-                        self._connection_id_to_addr.pop(k, None)
-                        self._connection_id_sequences.pop(k, None)
+            # or created more than max_age ago
+            for k, v in list(self._initial_connection_ids.items()):
+                created = self._pending_created_at.get(k, 0.0)
+                if v in stale_conns or (created > 0.0 and now - created > max_age):
+                    self._initial_connection_ids.pop(k, None)
+                    self._pending_created_at.pop(k, None)
+                    self._connection_id_to_addr.pop(k, None)
+                    self._connection_id_sequences.pop(k, None)
+                    stale_conns.add(v)
+
+            # Purge underlying aioquic connection objects to free memory
+            for conn in stale_conns:
+                try:
+                    if hasattr(conn, "close"):
+                        conn.close()
+                except Exception:
+                    pass
+                try:
+                    conn._events.clear()
+                except Exception:
+                    pass
+                try:
+                    conn._streams.clear()
+                except Exception:
+                    pass
             return stale_cids
 
     async def get_all_pending_cids(self) -> list[bytes]:
