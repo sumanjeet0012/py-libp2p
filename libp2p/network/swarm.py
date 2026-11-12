@@ -3429,6 +3429,43 @@ class Swarm(Service, INetworkService):
                         exc_info=True,
                     )
 
+    async def prune_closed_connections(self) -> int:
+        """
+        Close and unregister connections that are already dead.
+
+        go-libp2p removes a connection from the swarm table synchronously in
+        ``removeConn`` and its ``Close`` waits for the session goroutines to
+        exit, so a closed connection can never stay registered.  Python close
+        paths are spread across independent task trees, so reconcile the table
+        with reality and tear down any stale task tree.  This is the safety net
+        that keeps a long-running node's connection state bounded even if one
+        close path is missed or cancelled midway.
+        """
+        stale: list[SwarmConn] = []
+        for conns in list(self.connections.values()):
+            for conn in list(conns):
+                try:
+                    is_closed = conn.event_closed.is_set() or conn.muxed_conn.is_closed
+                except Exception:
+                    is_closed = True
+                if is_closed:
+                    stale.append(conn)
+
+        pruned = 0
+        for conn in stale:
+            try:
+                await conn.close()
+            except Exception:
+                logger.debug("Error closing stale connection", exc_info=True)
+            # remove_conn is idempotent and covers connections whose close()
+            # path was interrupted before its own cleanup ran.
+            self.remove_conn(conn)
+            pruned += 1
+
+        if pruned:
+            logger.info("Pruned %d closed connection(s) from swarm table", pruned)
+        return pruned
+
     # Health monitoring methods (conditional on health monitoring being enabled)
 
     @property

@@ -809,6 +809,14 @@ class Yamux(IMuxedConn):
                 self.event_shutting_down.set()
                 # Close channel to unblock accept_stream
                 self.new_stream_send_channel.close()
+                # go-yamux's Session.Close tears the session down synchronously
+                # and waits for the send/recv goroutines to exit.  Cancel the
+                # muxer's background loops here instead of relying on the RTT
+                # loop's 30s sleep to notice the shutdown flag, otherwise a
+                # retired connection keeps its task tree (and all objects
+                # reachable from it) alive long after it closed.
+                if self._nursery is not None:
+                    self._nursery.cancel_scope.cancel()
                 for stream in self.streams.values():
                     stream.closed = True
                     stream.send_closed = True

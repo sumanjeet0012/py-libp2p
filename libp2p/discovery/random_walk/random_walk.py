@@ -1,3 +1,4 @@
+from collections import deque
 from collections.abc import Awaitable, Callable
 import logging
 import secrets
@@ -193,10 +194,22 @@ class RandomWalk:
             except Exception as e:
                 logger.warning(f"Error processing peerstore peers: {e}")
 
-        sem = trio.Semaphore(count)
+        # Bounded worker pool, mirroring go-libp2p-kad-dht's crawler: it starts
+        # exactly `parallelism` workers and feeds them a jobs channel.  Prior
+        # code spawned one task per target key and only limited *execution*
+        # with a semaphore, so a large routing table enqueued hundreds of
+        # dormant tasks whose coroutine frames (and everything reachable from
+        # them) stayed alive for the whole refresh window.
+        pending_keys: deque[bytes | None] = deque(keys_to_query)
+        worker_count = max(1, min(count, len(pending_keys)))
+        queue_lock = trio.Lock()
 
-        async def single_walk(key: bytes | None) -> None:
-            async with sem:
+        async def walk_worker() -> None:
+            while True:
+                async with queue_lock:
+                    if not pending_keys:
+                        return
+                    key = pending_keys.popleft()
                 try:
                     peers = await self.perform_random_walk(target_key=key)
                     all_validated_peers.extend(peers)
@@ -205,8 +218,8 @@ class RandomWalk:
 
         try:
             async with trio.open_nursery() as nursery:
-                for key in keys_to_query:
-                    nursery.start_soon(single_walk, key)
+                for _ in range(worker_count):
+                    nursery.start_soon(walk_worker)
         except Exception as e:
             logger.debug(f"Random walk batch scope ended: {e}")
 
