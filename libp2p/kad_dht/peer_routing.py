@@ -235,7 +235,11 @@ class PeerRouting(IPeerRouting):
             # If still not enough, get peers from peerstore
             if len(closest_peers) < count:
                 try:
-                    peerstore_peers = self.host.get_peerstore().peer_ids()
+                    ps = self.host.get_peerstore()
+                    if hasattr(ps, "sample_peer_ids"):
+                        peerstore_peers = ps.sample_peer_ids(limit=count * 3)
+                    else:
+                        peerstore_peers = ps.peer_ids()
                     # Filter out our own ID and already included peers
                     local_id = self.host.get_id()
                     existing_peers = set(closest_peers)

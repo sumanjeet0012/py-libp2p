@@ -472,3 +472,24 @@ def test_sync_peerstore_lru_access_order():
     assert pid4 in store.peer_data_map
 
     store.close()
+
+
+def test_sync_peerstore_count_peers(tmp_path):
+    from libp2p.crypto.ed25519 import create_new_key_pair
+    from libp2p.peer.persistent.datastore.sqlite_sync import SQLiteDatastoreSync
+    from libp2p.peer.persistent.sync.peerstore import SyncPersistentPeerStore
+
+    db_path = tmp_path / "count_peerstore.db"
+    datastore = SQLiteDatastoreSync(path=db_path)
+    store = SyncPersistentPeerStore(datastore)
+
+    assert store.count_peers() == 0
+
+    for i in range(5):
+        kp = create_new_key_pair()
+        pid = ID.from_pubkey(kp.public_key)
+        store.add_addrs(pid, [Multiaddr(f"/ip4/192.168.1.{i + 1}/tcp/4001")], ttl=3600)
+
+    assert store.count_peers() == 5
+    store.close()
+

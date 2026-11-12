@@ -431,16 +431,27 @@ class SyncPersistentPeerStore(IPeerStore):
             self._save_peer_data(peer_id, peer_data)
         return PeerInfo(peer_id, peer_data.get_addrs())
 
+    def count_peers(self) -> int:
+        """Return the number of peers stored without materializing them."""
+        if hasattr(self.datastore, "count"):
+            return self.datastore.count(self.ADDR_PREFIX)
+        return len(self.peer_data_map)
+
     def peer_ids(self) -> list[ID]:
         """
         :return: all of the peer IDs stored in peer store
         """
-        # Get all peer IDs from datastore by querying all prefixes
+        # Get all peer IDs from datastore by querying address keys
         peer_ids = set()
 
         try:
-            # Query all address keys to find peer IDs
-            for key, _ in self.datastore.query(self.ADDR_PREFIX):
+            # Query only address keys (not values) to find peer IDs
+            key_iter = (
+                self.datastore.query_keys(self.ADDR_PREFIX)
+                if hasattr(self.datastore, "query_keys")
+                else (k for k, _ in self.datastore.query(self.ADDR_PREFIX))
+            )
+            for key in key_iter:
                 if key.startswith(self.ADDR_PREFIX):
                     peer_id_bytes = key[len(self.ADDR_PREFIX) :]
                     try:

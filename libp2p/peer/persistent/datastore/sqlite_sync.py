@@ -104,7 +104,7 @@ class SQLiteDatastoreSync(IBatchingDatastoreSync):
                     cursor.execute(
                         "PRAGMA synchronous=NORMAL"
                     )  # Balance between safety and performance
-                    cursor.execute("PRAGMA cache_size=10000")  # Increase cache size
+                    cursor.execute("PRAGMA cache_size=1000")  # Bounded 4MB cache size
                     cursor.execute(
                         "PRAGMA temp_store=MEMORY"
                     )  # Use memory for temp storage
@@ -214,6 +214,24 @@ class SQLiteDatastoreSync(IBatchingDatastoreSync):
 
             for row in cursor:
                 yield row[0]
+
+    def count(self, prefix: bytes = b"") -> int:
+        """Count keys matching an optional prefix without fetching rows."""
+        self._ensure_connection()
+        if self.connection is None:
+            raise ValueError("SQLite connection is not initialized")
+
+        with self._lock:
+            cursor = self.connection.cursor()
+            if prefix:
+                cursor.execute(
+                    "SELECT count(*) FROM datastore WHERE substr(key, 1, ?) = ?",
+                    (len(prefix), prefix),
+                )
+            else:
+                cursor.execute("SELECT count(*) FROM datastore")
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
 
     def batch(self) -> IBatchSync:
         """Create a new batch for atomic operations."""
