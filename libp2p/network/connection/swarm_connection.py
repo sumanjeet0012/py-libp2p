@@ -230,6 +230,20 @@ class SwarmConn(INetConn):
         if self._nursery is not None:
             self._nursery.cancel_scope.cancel()
 
+        # Cancel manager tasks (swarm_conn.start and muxed_conn.start) if tracked
+        task = getattr(self, "_task", None)
+        if task is not None and hasattr(task, "_cancel_scope"):
+            try:
+                task._cancel_scope.cancel()
+            except Exception:
+                pass
+        muxed_task = getattr(self.muxed_conn, "_task", None)
+        if muxed_task is not None and hasattr(muxed_task, "_cancel_scope"):
+            try:
+                muxed_task._cancel_scope.cancel()
+            except Exception:
+                pass
+
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
         try:

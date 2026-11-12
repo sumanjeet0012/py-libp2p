@@ -2986,7 +2986,12 @@ class Swarm(Service, INetworkService):
         # _current_connections counter.
         try:
             logger.debug("Swarm::add_conn | starting muxed connection")
-            self.manager.run_task(muxed_conn.start)
+            task_muxed = self.manager.run_task(
+                muxed_conn.start,
+                name=f"muxed_conn.start:{muxed_conn.peer_id}",
+                parent=None,
+            )
+            setattr(muxed_conn, "_task", task_muxed)
             await muxed_conn.event_started.wait()
 
             if muxed_conn.is_closed:
@@ -3009,7 +3014,12 @@ class Swarm(Service, INetworkService):
                     f"is_established=False for peer {muxed_conn.peer_id}"
                 )
             logger.debug("Swarm::add_conn | starting swarm connection")
-            self.manager.run_task(swarm_conn.start)
+            task_swarm = self.manager.run_task(
+                swarm_conn.start,
+                name=f"swarm_conn.start:{muxed_conn.peer_id}",
+                parent=None,
+            )
+            setattr(swarm_conn, "_task", task_swarm)
             await swarm_conn.event_started.wait()
 
             # Guard against race: SwarmConn's lifecycle task detected a dead
@@ -3204,7 +3214,12 @@ class Swarm(Service, INetworkService):
             return
         self._last_auto_connect_trigger = now
         try:
-            self.manager.run_task(self.auto_connector.maybe_connect, "disconnect")
+            self.manager.run_task(
+                self.auto_connector.maybe_connect,
+                "disconnect",
+                name="auto_connector.maybe_connect",
+                parent=None,
+            )
         except Exception:
             # No running manager — auto-connector is not started either.
             logger.debug("Failed to schedule auto-connect", exc_info=True)
@@ -3222,7 +3237,11 @@ class Swarm(Service, INetworkService):
             return
         self._last_prune_attempt = now
         try:
-            self.manager.run_task(self._prune_in_background)
+            self.manager.run_task(
+                self._prune_in_background,
+                name="swarm._prune_in_background",
+                parent=None,
+            )
         except Exception:
             # No running manager (e.g. swarm not started yet) — pruner is not
             # started either, so there is nothing to do.
@@ -3348,7 +3367,12 @@ class Swarm(Service, INetworkService):
             logger.debug(f"Trimming connection for peer {peer_id}")
             self.cleanup_connection_health(peer_id, conn)
             try:
-                self.manager.run_task(self._close_connection_async, conn)
+                self.manager.run_task(
+                    self._close_connection_async,
+                    conn,
+                    name="swarm._close_connection_async",
+                    parent=None,
+                )
             except Exception:
                 # No running manager — fall back to a best-effort inline close.
                 logger.debug("Failed to schedule trimmed connection close")

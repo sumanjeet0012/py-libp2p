@@ -46,6 +46,7 @@ ERROR_SERVICE_TASK_ERROR = (
     "Service {service} task {task} {msg} with {exc_type}: {exc_value}"
 )
 ERROR_CANNOT_SCHEDULE_AFTER_STOP = "Cannot schedule task after service has stopped"
+_USE_CALLER_PARENT = object()
 
 
 class TrioManager(InternalManagerAPI):
@@ -429,7 +430,8 @@ class TrioManager(InternalManagerAPI):
         daemon: bool = False,
         name: str | None = None,
         _internal: bool = False,
-    ) -> None:
+        parent: Any = _USE_CALLER_PARENT,
+    ) -> Any:
         """
         Run a task in the background.
 
@@ -440,11 +442,15 @@ class TrioManager(InternalManagerAPI):
         - Schedules for execution
         """
         count_in_stats = not _internal
+        if parent is _USE_CALLER_PARENT:
+            actual_parent = self._find_parent_task(trio.lowlevel.current_task())
+        else:
+            actual_parent = parent
 
         task = FunctionTask(
             name=get_task_name(async_fn, name),
             daemon=daemon,
-            parent=self._find_parent_task(trio.lowlevel.current_task()),
+            parent=actual_parent,
             async_fn=async_fn,
             async_fn_args=args,
             count_in_stats=count_in_stats,
@@ -460,6 +466,7 @@ class TrioManager(InternalManagerAPI):
 
         # Schedule
         self._schedule_task(task)
+        return task
 
     @trio_typing.takes_callable_and_args
     def run_daemon_task(

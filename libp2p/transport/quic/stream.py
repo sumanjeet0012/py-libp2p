@@ -550,8 +550,9 @@ class QUICStream(IMuxedStream):
 
         try:
             # Send QUIC reset frame
-            self._connection._quic.reset_stream(self._stream_id, error_code)
-            await self._connection._transmit()
+            if self._connection and getattr(self._connection, "_quic", None):
+                self._connection._quic.reset_stream(self._stream_id, error_code)
+                await self._connection._transmit()
 
         except Exception as e:
             # ValueError for unknown peer-initiated streams is expected
@@ -699,9 +700,10 @@ class QUICStream(IMuxedStream):
 
         # Send RESET_STREAM in response (QUIC protocol requirement)
         try:
-            self._connection._quic.reset_stream(int(self.stream_id), error_code)
-            await self._connection._transmit()
-            logger.debug(f"Sent RESET_STREAM for stream {self.stream_id}")
+            if self._connection and getattr(self._connection, "_quic", None):
+                self._connection._quic.reset_stream(int(self.stream_id), error_code)
+                await self._connection._transmit()
+                logger.debug(f"Sent RESET_STREAM for stream {self.stream_id}")
         except Exception as e:
             logger.warning(
                 f"Could not send RESET_STREAM for stream {self.stream_id}: {e}"

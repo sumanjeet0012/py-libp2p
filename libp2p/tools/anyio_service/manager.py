@@ -493,7 +493,8 @@ class AnyIOManager(InternalManagerAPI):
         daemon: bool = False,
         name: str | None = None,
         _internal: bool = False,
-    ) -> None:
+        parent: Any = None,
+    ) -> Any:
         """
         Run a task in the background.
 
@@ -505,9 +506,10 @@ class AnyIOManager(InternalManagerAPI):
         """
         count_in_stats = not _internal
 
-        # Find parent task in the task hierarchy
-        current_anyio_task = anyio.get_current_task()
-        parent = self._find_parent_task(current_anyio_task)
+        # Find parent task in the task hierarchy if not explicitly provided
+        if parent is None:
+            current_anyio_task = anyio.get_current_task()
+            parent = self._find_parent_task(current_anyio_task)
 
         task = FunctionTask(
             name=get_task_name(async_fn, name),
@@ -528,6 +530,7 @@ class AnyIOManager(InternalManagerAPI):
 
         # Schedule
         self._schedule_task(task)
+        return task
 
     def run_daemon_task(
         self, async_fn: AsyncFn, *args: Any, name: str | None = None

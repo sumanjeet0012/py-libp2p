@@ -1962,6 +1962,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
                 self._streams.clear()
                 self._stream_cache.clear()  # Clear cache
                 self._closed_event.set()
+                self._stream_accept_event.set()
 
                 # Cancel background tasks (receiver, event loop, maintenance)
                 if hasattr(self, "_task_cancel_scopes"):
