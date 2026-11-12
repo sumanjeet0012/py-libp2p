@@ -29,7 +29,11 @@ from .tasks import (
     TaskType,
     TaskWithChildrenAPI,
 )
-from .utils import get_task_name, is_verbose_logging_enabled
+from .utils import (
+    MAX_COLLECTED_ERRORS,
+    get_task_name,
+    is_verbose_logging_enabled,
+)
 
 if TYPE_CHECKING:
     from .api import AsyncFn, ManagerAPI, ServiceAPI
@@ -131,6 +135,22 @@ class AnyIOManager(InternalManagerAPI):
     @property
     def did_error(self) -> bool:
         return len(self._errors) > 0
+
+    def _record_error(self, exc_info: EXC_INFO) -> None:
+        """
+        Record a task error without retaining unbounded traceback history.
+
+        Each entry keeps a traceback, and a traceback keeps all of its frame
+        locals alive.  A long-lived manager that appended one entry per task
+        failure would therefore pin the whole object graph (streams,
+        connections, buffers) of every failed task for the process lifetime.
+        Retain only the most recent errors; that is enough to build the
+        ExceptionGroup raised when the service finally exits.
+        """
+        self._errors.append(exc_info)
+        overflow = len(self._errors) - MAX_COLLECTED_ERRORS
+        if overflow > 0:
+            del self._errors[:overflow]
 
     @property
     def stats(self) -> Stats:
@@ -256,11 +276,11 @@ class AnyIOManager(InternalManagerAPI):
                         if isinstance(exc, ExceptionGroup):
                             # Extract individual exceptions from the group
                             for sub_exc in exc.exceptions:
-                                self._errors.append(
+                                self._record_error(
                                     (type(sub_exc), sub_exc, sub_exc.__traceback__)
                                 )
                         else:
-                            self._errors.append(cast(EXC_INFO, sys.exc_info()))
+                            self._record_error(cast(EXC_INFO, sys.exc_info()))
 
                     finally:
                         # Cancel system task group to clean up

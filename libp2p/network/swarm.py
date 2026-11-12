@@ -2242,6 +2242,7 @@ class Swarm(Service, INetworkService):
                 # Wait until the connection closes or the swarm shuts down.
                 with trio.CancelScope() as scope:
                     async with trio.open_nursery() as n:
+
                         async def _wait_closed() -> None:
                             await registered_conn.event_closed.wait()
                             scope.cancel()
@@ -2739,6 +2740,7 @@ class Swarm(Service, INetworkService):
 
         # Remove from connections dict
         self.connections.pop(peer_id, None)
+        self._round_robin_index.pop(peer_id, None)
 
         logger.debug("successfully close the connection to peer %s", peer_id)
 
@@ -3391,6 +3393,9 @@ class Swarm(Service, INetworkService):
             ]
             if not self.connections[peer_id]:
                 del self.connections[peer_id]
+                # Round-robin stream balancing state is only meaningful while
+                # the peer has a live connection; drop it with the peer.
+                self._round_robin_index.pop(peer_id, None)
 
         logger.info(
             "remove_conn: peer=%s id=%d conns_before=%d conns_after=%d",
