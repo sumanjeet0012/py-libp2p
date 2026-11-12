@@ -172,7 +172,6 @@ class PingService(INotifee):
         self._rcmgr = rcmgr
         self._outbound_streams: dict[PeerID, INetStream] = {}
         self._inbound_streams: dict[PeerID, set[INetStream]] = {}
-        self._lock = trio.Lock()
         try:
             network = self._host.get_network()
             if hasattr(network, "register_notifee"):
@@ -184,10 +183,9 @@ class PingService(INotifee):
         pass
 
     async def closed_stream(self, network: "INetwork", stream: INetStream) -> None:
-        async with self._lock:
-            for pid, s in list(self._outbound_streams.items()):
-                if s is stream:
-                    self._outbound_streams.pop(pid, None)
+        for pid, s in list(self._outbound_streams.items()):
+            if s is stream:
+                self._outbound_streams.pop(pid, None)
 
     async def connected(self, network: "INetwork", conn: "INetConn") -> None:
         pass
@@ -195,22 +193,21 @@ class PingService(INotifee):
     async def disconnected(self, network: "INetwork", conn: "INetConn") -> None:
         peer_id = getattr(getattr(conn, "muxed_conn", None), "peer_id", None)
         if peer_id is not None:
-            async with self._lock:
-                cached = self._outbound_streams.get(peer_id)
-                if cached is not None:
-                    cached_conn = getattr(cached, "swarm_conn", None)
-                    cached_muxed = getattr(cached, "muxed_conn", None)
-                    conn_muxed = getattr(conn, "muxed_conn", None)
-                    if (
-                        cached_conn is None
-                        or cached_conn == conn
-                        or cached_muxed is None
-                        or conn_muxed is None
-                        or cached_muxed == conn_muxed
-                        or getattr(cached, "is_closed", False)
-                    ):
-                        self._outbound_streams.pop(peer_id, None)
-                self._inbound_streams.pop(peer_id, None)
+            cached = self._outbound_streams.get(peer_id)
+            if cached is not None:
+                cached_conn = getattr(cached, "swarm_conn", None)
+                cached_muxed = getattr(cached, "muxed_conn", None)
+                conn_muxed = getattr(conn, "muxed_conn", None)
+                if (
+                    cached_conn is None
+                    or cached_conn == conn
+                    or cached_muxed is None
+                    or conn_muxed is None
+                    or cached_muxed == conn_muxed
+                    or getattr(cached, "is_closed", False)
+                ):
+                    self._outbound_streams.pop(peer_id, None)
+            self._inbound_streams.pop(peer_id, None)
 
     async def listen(self, network: "INetwork", multiaddr: Any) -> None:
         pass
@@ -225,13 +222,12 @@ class PingService(INotifee):
         """
         peer_id = stream.muxed_conn.peer_id
 
-        async with self._lock:
-            peer_streams = self._inbound_streams.setdefault(peer_id, set())
-            if len(peer_streams) >= 2:
-                logger.debug("Rejecting ping stream from %s: max 2 reached", peer_id)
-                await stream.reset()
-                return
-            peer_streams.add(stream)
+        peer_streams = self._inbound_streams.setdefault(peer_id, set())
+        if len(peer_streams) >= 2:
+            logger.debug("Rejecting ping stream from %s: max 2 reached", peer_id)
+            await stream.reset()
+            return
+        peer_streams.add(stream)
 
         try:
             while True:
@@ -262,11 +258,10 @@ class PingService(INotifee):
                     await stream.reset()
                     return
         finally:
-            async with self._lock:
-                if peer_id in self._inbound_streams:
-                    self._inbound_streams[peer_id].discard(stream)
-                    if not self._inbound_streams[peer_id]:
-                        self._inbound_streams.pop(peer_id, None)
+            if peer_id in self._inbound_streams:
+                self._inbound_streams[peer_id].discard(stream)
+                if not self._inbound_streams[peer_id]:
+                    self._inbound_streams.pop(peer_id, None)
 
     async def ping_iter(
         self,
@@ -277,24 +272,23 @@ class PingService(INotifee):
         if ping_amt < 1:
             raise ValueError(f"ping_amt must be >= 1, got {ping_amt!r}")
 
-        async with self._lock:
-            stream = self._outbound_streams.get(peer_id)
-            # Check if cached stream is still usable. A stream may be closed
-            # (connection dropped) or in reset state (protocol error). In both
-            # cases we must create a fresh stream.
-            needs_new = stream is None
-            if stream is not None:
-                is_closed = getattr(stream, "is_closed", False)
-                if callable(is_closed):
-                    is_closed = is_closed()
-                if is_closed:
+        stream = self._outbound_streams.get(peer_id)
+        # Check if cached stream is still usable. A stream may be closed
+        # (connection dropped) or in reset state (protocol error). In both
+        # cases we must create a fresh stream.
+        needs_new = stream is None
+        if stream is not None:
+            is_closed = getattr(stream, "is_closed", False)
+            if callable(is_closed):
+                is_closed = is_closed()
+            if is_closed:
+                needs_new = True
+            elif hasattr(stream, "_state"):
+                if getattr(stream._state, "value", None) == "RESET":
                     needs_new = True
-                elif hasattr(stream, "_state"):
-                    if getattr(stream._state, "value", None) == "RESET":
-                        needs_new = True
-            if needs_new:
-                stream = await self._host.new_stream(peer_id, [ID])
-                self._outbound_streams[peer_id] = stream
+        if needs_new:
+            stream = await self._host.new_stream(peer_id, [ID])
+            self._outbound_streams[peer_id] = stream
 
         assert stream is not None
         event: PingEvent | None = None
@@ -319,8 +313,7 @@ class PingService(INotifee):
             except Exception:
                 pass
             event = PingEvent(peer_id=peer_id, rtts=None, failure_error=error)
-            async with self._lock:
-                self._outbound_streams.pop(peer_id, None)
+            self._outbound_streams.pop(peer_id, None)
             raise
         finally:
             if event is not None:

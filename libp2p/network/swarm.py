@@ -3711,10 +3711,11 @@ class Swarm(Service, INetworkService):
                     method_name: str = method, n: INotifee = notifee
                 ) -> None:
                     try:
-                        await getattr(n, method_name)(self, *args)
+                        with trio.fail_after(5.0):
+                            await getattr(n, method_name)(self, *args)
                     except Exception:
                         logger.exception(
-                            "Notifee %s.%s raised for %s",
+                            "Notifee %s.%s raised or timed out for %s",
                             type(n).__name__,
                             method_name,
                             args[0] if args else "no-conn",
