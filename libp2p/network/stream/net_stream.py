@@ -372,8 +372,10 @@ class NetStream(INetStream):
         Remove the stream from the connection and notify swarm that stream was closed.
         """
         if self.swarm_conn is not None:
-            self.swarm_conn.remove_stream(self)
-            await self.swarm_conn.swarm.notify_closed_stream(self)
+            conn = self.swarm_conn
+            self.swarm_conn = None
+            conn.remove_stream(self)
+            await conn.swarm.notify_closed_stream(self)
 
     def get_remote_address(self) -> tuple[str, int] | None:
         """Delegate to the underlying muxed stream."""

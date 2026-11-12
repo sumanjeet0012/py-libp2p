@@ -244,6 +244,18 @@ class SwarmConn(INetConn):
             except Exception:
                 pass
 
+        # Break cyclic references between muxed_conn and SwarmConn
+        if hasattr(self.muxed_conn, "on_close"):
+            try:
+                delattr(self.muxed_conn, "on_close")
+            except Exception:
+                pass
+        if hasattr(self.muxed_conn, "remove_stream"):
+            try:
+                delattr(self.muxed_conn, "remove_stream")
+            except Exception:
+                pass
+
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
         try:
