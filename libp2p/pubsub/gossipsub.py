@@ -1678,6 +1678,8 @@ class GossipSub(IPubsubRouter, Service):
             return True
         else:
             del self.back_off[topic][peer]
+            if not self.back_off[topic]:
+                del self.back_off[topic]
             return False
 
     def _prune_idontwant_entries(self) -> None:
@@ -3562,6 +3564,15 @@ class GossipSub(IPubsubRouter, Service):
         Periodic cleanup of security-related data structures.
         """
         current_time = time.time()
+
+        # A departed peer may never be checked by _check_back_off again.
+        # Preserve live bans across reconnects, then expire them on heartbeat.
+        for topic, peers in list(self.back_off.items()):
+            for peer, deadline in list(peers.items()):
+                if deadline <= current_time:
+                    del peers[peer]
+            if not peers:
+                del self.back_off[topic]
 
         # Clean up old equivocation detection entries
         # Note: Message objects don't have _timestamp, so we'll just clear old entries

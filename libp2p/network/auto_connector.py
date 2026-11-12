@@ -184,6 +184,7 @@ class AutoConnector:
         # 0x1005) get quarantined so dial budget goes to peers that keep
         # connections open instead of being recycled into the same evictors.
         self._quick_deaths: dict[ID, int] = {}
+        self._quick_death_at: dict[ID, float] = {}
         self._quarantine_until: dict[ID, float] = {}
         self._quarantine_count: dict[ID, int] = {}
         self._last_quarantine_at: dict[ID, float] = {}
@@ -207,7 +208,10 @@ class AutoConnector:
         # auto-connector triggered, how many candidates it selected, and
         # what happened to every dial.
         self._dial_history: dict[ID, list[tuple[float, str]]] = {}
-        self._ever_dialed: set[ID] = set()
+        # Diagnostics must not retain every peer seen over the host lifetime.
+        # unique_dialed now counts peers in the bounded 30-minute history.
+        self._max_tracking_peers = 4096
+        self._last_tracking_prune = 0.0
         self._last_emitted_dialed = 0
         self._last_emitted_ok = 0
         self._last_emitted_ok_deadline = 0
@@ -325,6 +329,8 @@ class AutoConnector:
             logger.debug("Auto-connect cycle already in progress, skipping")
             return
 
+        # Reap stale history even when we are already above the dial target.
+        self._prune_tracking_caches()
         self._stats["cycles"] += 1
         if trigger == "disconnect":
             self._stats["trigger_disconnect"] += 1
@@ -563,13 +569,14 @@ class AutoConnector:
         """
         if outcome in self._stats:
             self._stats[outcome] += 1
-        if peer_id not in self._ever_dialed:
-            self._ever_dialed.add(peer_id)
-            self._stats["unique_dialed"] = len(self._ever_dialed)
-        history = self._dial_history.setdefault(peer_id, [])
+        history = self._dial_history.pop(peer_id, [])
         history.append((time.time(), outcome))
         if len(history) > 20:
             del history[: len(history) - 20]
+        self._dial_history[peer_id] = history
+        if len(self._dial_history) > self._max_tracking_peers:
+            self._dial_history.pop(next(iter(self._dial_history)))
+        self._stats["unique_dialed"] = len(self._dial_history)
 
     def _emit_cycle_stats(
         self,
@@ -624,7 +631,7 @@ class AutoConnector:
         logger.info(
             "AUTO_CONNECT_STATS: cycles=%s trigger_disconnect=%s "
             "candidates_seen=%s candidates_dialable=%s dialed=%s ok=%s "
-            "ok_after_deadline=%s timeout=%s failed=%s unique_dialed=%s "
+            "ok_after_deadline=%s timeout=%s failed=%s recent_unique_dialed=%s "
             "repeat_peers=%s repeat_dials_5m=%s",
             stats["cycles"],
             stats["trigger_disconnect"],
@@ -667,7 +674,10 @@ class AutoConnector:
     def _prune_tracking_caches(self) -> None:
         """Prune tracking dictionaries to prevent memory accumulation."""
         now = time.time()
-        if len(self._last_connect_attempt) > 500:
+        if now - self._last_tracking_prune < 30.0:
+            return
+        self._last_tracking_prune = now
+        if self._last_connect_attempt:
             stale_keys = [
                 pid
                 for pid, ts in self._last_connect_attempt.items()
@@ -677,7 +687,7 @@ class AutoConnector:
                 self._last_connect_attempt.pop(pid, None)
                 self._failure_counts.pop(pid, None)
 
-        if len(self._recent_disconnects) > 500:
+        if self._recent_disconnects:
             stale_disc = [
                 pid
                 for pid, ts in self._recent_disconnects.items()
@@ -694,7 +704,38 @@ class AutoConnector:
                 self._quarantine_until.pop(pid, None)
                 self._quarantine_count.pop(pid, None)
                 self._quick_deaths.pop(pid, None)
+                self._quick_death_at.pop(pid, None)
                 self._last_quarantine_at.pop(pid, None)
+
+        for pid, timestamp in list(self._quick_death_at.items()):
+            if pid not in self._quarantine_until and (
+                now - timestamp > self._offense_decay_seconds
+            ):
+                self._quick_death_at.pop(pid, None)
+                self._quick_deaths.pop(pid, None)
+
+        # TTLs bound age; caps also bound high-churn bursts between expirations.
+        for tracking in (self._last_connect_attempt, self._recent_disconnects):
+            overflow = len(tracking) - self._max_tracking_peers
+            if overflow > 0:
+                oldest = sorted(tracking, key=lambda pid: tracking[pid])[:overflow]
+                for pid in oldest:
+                    tracking.pop(pid, None)
+                    if tracking is self._last_connect_attempt:
+                        self._failure_counts.pop(pid, None)
+        overflow = len(self._quick_deaths) - self._max_tracking_peers
+        if overflow > 0:
+            candidates = sorted(
+                (
+                    pid
+                    for pid in self._quick_death_at
+                    if pid not in self._quarantine_until
+                ),
+                key=lambda pid: self._quick_death_at[pid],
+            )
+            for pid in candidates[:overflow]:
+                self._quick_deaths.pop(pid, None)
+                self._quick_death_at.pop(pid, None)
 
         if self._dial_history:
             stale_history = [
@@ -704,6 +745,7 @@ class AutoConnector:
             ]
             for pid in stale_history:
                 self._dial_history.pop(pid, None)
+        self._stats["unique_dialed"] = len(self._dial_history)
 
     async def _get_candidate_peers(self) -> list[ID]:
         """
@@ -922,17 +964,25 @@ class AutoConnector:
             Connection duration in seconds, or None if unknown
 
         """
-        self._recent_disconnects[peer_id] = time.time()
+        now = time.time()
+        self._recent_disconnects.pop(peer_id, None)
+        self._recent_disconnects[peer_id] = now
+        if len(self._recent_disconnects) > self._max_tracking_peers:
+            self._recent_disconnects.pop(next(iter(self._recent_disconnects)))
 
         if lifespan is None or lifespan >= self._quick_death_threshold:
             # Survived long enough — a keeper, not an evictor.  Reset any
             # prior quick-death streak so soft blips do not accumulate.
             if lifespan is not None:
-                self._quick_deaths[peer_id] = 0
+                self._quick_deaths.pop(peer_id, None)
+                self._quick_death_at.pop(peer_id, None)
             return
 
+        if now - self._quick_death_at.get(peer_id, now) > self._offense_decay_seconds:
+            self._quick_deaths.pop(peer_id, None)
         count = self._quick_deaths.get(peer_id, 0) + 1
         self._quick_deaths[peer_id] = count
+        self._quick_death_at[peer_id] = now
         if count < self._quick_death_limit:
             return
 
@@ -980,6 +1030,7 @@ class AutoConnector:
             self._quarantine_until.pop(pid, None)
             self._quarantine_count.pop(pid, None)
             self._quick_deaths.pop(pid, None)
+            self._quick_death_at.pop(pid, None)
             self._last_quarantine_at.pop(pid, None)
         logger.info(
             "QUARANTINE: set exceeded %d entries; released %d soonest-expiring "
@@ -1023,8 +1074,8 @@ class AutoConnector:
         self._failure_counts.clear()
         self._recent_disconnects.clear()
         self._quick_deaths.clear()
+        self._quick_death_at.clear()
         self._quarantine_until.clear()
         self._quarantine_count.clear()
         self._last_quarantine_at.clear()
         self._dial_history.clear()
-        self._ever_dialed.clear()
