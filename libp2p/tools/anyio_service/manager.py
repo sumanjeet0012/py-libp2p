@@ -408,10 +408,6 @@ class AnyIOManager(InternalManagerAPI):
             # Cancellation is expected during shutdown, not an error
             if self._verbose:
                 self.logger.debug("%s: task %s was cancelled", self._service, task)
-            # Don't collect as error or trigger additional cancellation
-            # But still clean up root task tracking
-            if task.parent is None:
-                self._root_tasks.discard(task)
 
         except Exception as err:
             from libp2p.utils.connection_shutdown import (
@@ -427,8 +423,6 @@ class AnyIOManager(InternalManagerAPI):
                     direction="task_exit",
                     exc=err,
                 )
-                if task.parent is None:
-                    self._root_tasks.discard(task)
                 if isinstance(task, FunctionTask) and task.count_in_stats:
                     self._finished_task_count += 1
             else:
@@ -455,8 +449,6 @@ class AnyIOManager(InternalManagerAPI):
 
         else:
             # Task completed successfully
-            if task.parent is None:
-                self._root_tasks.discard(task)
             # Only count user tasks in finished stats (not internal framework tasks)
             if isinstance(task, FunctionTask) and task.count_in_stats:
                 self._finished_task_count += 1
@@ -464,6 +456,10 @@ class AnyIOManager(InternalManagerAPI):
                 self.logger.debug("%s: task %s exited cleanly.", self._service, task)
 
         finally:
+            if task.parent is None:
+                self._root_tasks.discard(task)
+            elif hasattr(task.parent, "discard_child"):
+                task.parent.discard_child(task)
             self._done_task_count += 1
 
     # ========================================================================
