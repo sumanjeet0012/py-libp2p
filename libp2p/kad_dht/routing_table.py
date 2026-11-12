@@ -356,19 +356,23 @@ class KBucket:
         """
         from libp2p.host.ping import PingService
 
+        ping_service = PingService(self.host)
+        responsive = False
         try:
-            ping_service = PingService(self.host)
             rtts = await ping_service.ping(peer_id, ping_amt=1)
             if rtts:
                 logger.debug(
                     f"Successfully pinged peer {peer_id} "
                     f"(RTT: {rtts[0]}ms via libp2p ping)"
                 )
-                return True
-            return False
+                responsive = True
         except Exception as e:
             logger.debug(f"Failed to ping peer {peer_id} via libp2p ping: {e}")
-            return False
+        finally:
+            # This is a one-shot probe, not a long-lived reusable service.
+            # Swarm keeps strong references to registered notifees.
+            await ping_service.aclose()
+        return responsive
 
     def refresh_peer_last_seen(self, peer_id: ID) -> bool:
         """

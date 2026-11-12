@@ -311,6 +311,9 @@ class NetStream(INetStream):
     async def close(self) -> None:
         """Close stream completely and clean up resources."""
         await self.muxed_stream.close()
+        close_read = getattr(self.muxed_stream, "close_read", None)
+        if callable(close_read):
+            await cast(Callable[[], Awaitable[None]], close_read)()
         await self.set_state(StreamState.CLOSE_BOTH)
         await self.remove()
 

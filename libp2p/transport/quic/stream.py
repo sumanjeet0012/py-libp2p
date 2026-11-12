@@ -512,6 +512,13 @@ class QUICStream(IMuxedStream):
             return
 
         try:
+            if self._connection and getattr(self._connection, "_quic", None):
+                try:
+                    self._connection._quic.stop_stream(self._stream_id, 0)
+                    await self._connection._transmit()
+                except ValueError:
+                    # aioquic may already have discarded a finished stream.
+                    logger.debug("Receive side already gone for %s", self.stream_id)
             self._read_closed = True
             self._timeline.touch()
 
@@ -552,6 +559,10 @@ class QUICStream(IMuxedStream):
             # Send QUIC reset frame
             if self._connection and getattr(self._connection, "_quic", None):
                 self._connection._quic.reset_stream(self._stream_id, error_code)
+                try:
+                    self._connection._quic.stop_stream(self._stream_id, error_code)
+                except ValueError:
+                    logger.debug("Receive side already gone for %s", self.stream_id)
                 await self._connection._transmit()
 
         except Exception as e:
@@ -563,9 +574,13 @@ class QUICStream(IMuxedStream):
                 logger.error(f"Error sending reset for stream {self.stream_id}: {e}")
         finally:
             # Always cleanup resources
-            await self._cleanup_resources()
-            self._timeline.record_reset(error_code)
-            self._close_event.set()
+            with trio.CancelScope() as cleanup_scope:
+                cleanup_scope.shield = True
+                await self._cleanup_resources()
+                self._timeline.record_reset(error_code)
+                self._close_event.set()
+                self._receive_event.set()
+                self._backpressure_event.set()
 
     def is_closed(self) -> bool:
         """Check if stream is completely closed."""

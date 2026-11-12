@@ -180,6 +180,9 @@ class YamuxStream(IMuxedStream):
         # holding unread buffered data (used by the stale-stream sweeper to
         # reclaim the entry after a grace period). 0.0 = not fully closed yet.
         self._closed_at = 0.0
+        # Full application close abandons reads, unlike a deliberate write
+        # half-close. Give the peer time to finish before resetting this side.
+        self._read_abandoned_at: float | None = None
         self.send_window = DEFAULT_WINDOW_SIZE
         self.recv_window = DEFAULT_WINDOW_SIZE
         self.window_lock = trio.Lock()
@@ -627,6 +630,11 @@ class YamuxStream(IMuxedStream):
                 self, fully_closed=(self.send_closed and self.recv_closed)
             )
 
+    async def close_read(self) -> None:
+        """Abandon reads, allowing a grace period for the peer's FIN."""
+        if not self.recv_closed and self._read_abandoned_at is None:
+            self._read_abandoned_at = trio.current_time()
+
     async def reset(self) -> None:
         if not self.closed:
             async with self.close_lock:
@@ -1059,12 +1067,29 @@ class Yamux(IMuxedConn):
             )
         return reclaimed
 
+    async def _reset_abandoned_streams(self, now: float | None = None) -> int:
+        """Bound the lifetime of streams fully closed by the application."""
+        if now is None:
+            now = trio.current_time()
+        async with self.streams_lock:
+            abandoned = [
+                stream
+                for stream in self.streams.values()
+                if stream._read_abandoned_at is not None
+                and not stream.recv_closed
+                and now - stream._read_abandoned_at >= _STALE_STREAM_GRACE_SECONDS
+            ]
+        for stream in abandoned:
+            await stream.reset()
+        return len(abandoned)
+
     async def _stale_stream_sweeper(self) -> None:
         """Periodically reclaim bookkeeping of fully-closed stale streams."""
         while not self.event_shutting_down.is_set():
             await trio.sleep(_STALE_STREAM_SWEEP_INTERVAL)
             if self.event_shutting_down.is_set():
                 break
+            await self._reset_abandoned_streams()
             async with self.streams_lock:
                 self._sweep_stale_streams()
 

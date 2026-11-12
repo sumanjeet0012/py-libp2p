@@ -1,0 +1,198 @@
+"""Regression checks for ownership retained after one-shot network operations."""
+
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import QuicConnection
+from aioquic.quic.packet_builder import QuicDeliveryState
+import trio
+
+from libp2p.abc import IHost, ISecureConn
+from libp2p.host.ping import PingService
+from libp2p.kad_dht.routing_table import KBucket
+from libp2p.network.connection.swarm_connection import SwarmConn
+from libp2p.network.stream.net_stream import NetStream
+from libp2p.peer.id import ID
+from libp2p.stream_muxer.yamux.yamux import Yamux, YamuxStream
+from libp2p.transport.quic.config import QUICTransportConfig
+from libp2p.transport.quic.connection import QUICConnection
+from libp2p.transport.quic.stream import QUICStream, StreamDirection
+
+
+@pytest.mark.trio
+async def test_dht_probes_release_listeners_and_streams():
+    notifees = []
+    network = SimpleNamespace(
+        register_notifee=notifees.append, remove_notifee=notifees.remove
+    )
+    streams = []
+
+    class EchoStream:
+        is_closed = False
+
+        def __init__(self):
+            self.payload = b""
+
+        async def write(self, data):
+            self.payload = data
+
+        async def read(self, n):
+            return self.payload
+
+        async def reset(self):
+            await trio.lowlevel.checkpoint()
+            self.is_closed = True
+
+    async def new_stream(*args):
+        stream = EchoStream()
+        streams.append(stream)
+        return stream
+
+    host: Any = SimpleNamespace(
+        get_network=lambda: network,
+        new_stream=new_stream,
+        get_event_bus=lambda: SimpleNamespace(emit=lambda e: None),
+    )
+    bucket = KBucket(host)
+    peer_id = ID(b"same-peer")
+    for _ in range(100):
+        assert await bucket._ping_peer(peer_id)
+        assert not notifees
+    assert all(stream.is_closed for stream in streams)
+
+    async def fail(*args):
+        raise OSError("dial failed")
+
+    host.new_stream = fail
+    assert not await bucket._ping_peer(peer_id)
+    assert not notifees
+
+    async def block(*args):
+        await trio.sleep_forever()
+
+    host.new_stream = block
+    with trio.move_on_after(0.01) as scope:
+        await bucket._ping_peer(peer_id)
+    assert scope.cancelled_caught
+    assert not notifees
+
+
+@pytest.mark.trio
+async def test_outer_ping_deadline_resets_stream_and_preserves_cancellation():
+    class Stream:
+        is_closed = False
+        reset_calls = 0
+
+        async def write(self, data):
+            await trio.sleep_forever()
+
+        async def reset(self):
+            # Cleanup must reach checkpoints even under outer cancellation.
+            await trio.lowlevel.checkpoint()
+            self.reset_calls += 1
+
+    stream = Stream()
+
+    async def new_stream(*args):
+        return stream
+
+    service = PingService(cast(IHost, SimpleNamespace(new_stream=new_stream)))
+    with pytest.raises(trio.TooSlowError):
+        with trio.fail_after(0.01):
+            await service.ping(ID(b"peer"))
+    assert stream.reset_calls == 1
+    assert not service._outbound_streams
+
+
+@pytest.mark.trio
+async def test_quic_reset_requests_receive_termination_and_wakes_readers():
+    quic = QuicConnection(configuration=QuicConfiguration(is_client=True))
+    quic.send_stream_data(0, b"probe")
+    removed = []
+
+    async def transmit():
+        pass
+
+    parent = SimpleNamespace(
+        _quic=quic,
+        _transmit=transmit,
+        _remove_stream=removed.append,
+        _transport=SimpleNamespace(_config=QUICTransportConfig()),
+        remote_peer_id=lambda: "peer",
+        stream_send_buffer_size=lambda sid: 0,
+        _signal_activity=lambda: None,
+    )
+    stream = QUICStream(
+        cast(QUICConnection, parent), 0, StreamDirection.OUTBOUND, ("127.0.0.1", 1)
+    )
+    await stream.reset(error_code=7)
+    transport_stream = quic._streams[0]
+    assert transport_stream.receiver.stop_pending
+    transport_stream.sender.on_reset_delivery(QuicDeliveryState.ACKED)
+    transport_stream.receiver.handle_reset(final_size=0)
+    assert transport_stream.is_finished
+    assert removed == [0]
+    assert stream._receive_event.is_set()
+
+
+@pytest.mark.trio
+async def test_quic_close_read_requests_stop_without_resetting_write():
+    quic = QuicConnection(configuration=QuicConfiguration(is_client=True))
+    quic.send_stream_data(0, b"probe")
+
+    async def transmit():
+        pass
+
+    parent = SimpleNamespace(
+        _quic=quic,
+        _transmit=transmit,
+        _transport=SimpleNamespace(_config=QUICTransportConfig()),
+        remote_peer_id=lambda: "peer",
+        stream_send_buffer_size=lambda sid: 0,
+        _signal_activity=lambda: None,
+    )
+    stream = QUICStream(
+        cast(QUICConnection, parent), 0, StreamDirection.OUTBOUND, ("127.0.0.1", 1)
+    )
+    await stream.close_read()
+    assert quic._streams[0].receiver.stop_pending
+    assert not quic._streams[0].sender.reset_pending
+    await stream.write(b"still writable")
+
+
+@pytest.mark.trio
+async def test_yamux_full_close_is_bounded_but_write_half_close_is_preserved():
+    async def write(data):
+        pass
+
+    async def notify(stream):
+        pass
+
+    yamux = Yamux(
+        cast(ISecureConn, SimpleNamespace(is_initiator=True, write=write)), ID(b"peer")
+    )
+    conn = cast(
+        SwarmConn,
+        SimpleNamespace(
+            muxed_conn=yamux,
+            remove_stream=lambda stream: None,
+            swarm=SimpleNamespace(notify_closed_stream=notify),
+        ),
+    )
+    full = NetStream(await yamux.open_stream(), conn, None)
+    half = NetStream(await yamux.open_stream(), conn, None)
+    await full.close()
+    await half.close_write()
+    abandoned = cast(YamuxStream, full.muxed_stream)
+    half_stream = cast(YamuxStream, half.muxed_stream)
+    assert half_stream.send_closed
+    assert half_stream._read_abandoned_at is None
+    closed_at = abandoned._read_abandoned_at
+    assert closed_at is not None
+    assert await yamux._reset_abandoned_streams(now=closed_at) == 0
+    assert await yamux._reset_abandoned_streams(now=closed_at + 1000) == 1
+    assert abandoned.stream_id not in yamux.streams
+    assert half_stream.stream_id in yamux.streams
+    assert not half_stream.recv_closed

@@ -179,6 +179,31 @@ class PingService(INotifee):
         except Exception:
             pass
 
+    async def aclose(self) -> None:
+        """Unregister this service and terminate streams owned by it."""
+        try:
+            network = self._host.get_network()
+            if hasattr(network, "remove_notifee"):
+                network.remove_notifee(self)
+        except Exception:
+            logger.debug("Failed to unregister ping service", exc_info=True)
+        finally:
+            streams = set(self._outbound_streams.values())
+            for inbound in self._inbound_streams.values():
+                streams.update(inbound)
+            self._outbound_streams.clear()
+            self._inbound_streams.clear()
+
+            # A cancelled probe must not leave its streams behind. Bound the
+            # shield so a broken transport cannot stall DHT maintenance.
+            with trio.move_on_after(5) as cleanup_scope:
+                cleanup_scope.shield = True
+                for stream in streams:
+                    try:
+                        await stream.reset()
+                    except Exception:
+                        logger.debug("Failed to reset ping stream", exc_info=True)
+
     async def opened_stream(self, network: "INetwork", stream: INetStream) -> None:
         pass
 
@@ -307,13 +332,19 @@ class PingService(INotifee):
             # so the stream stays alive. QUIC idle timeout handles cleanup
             # if the connection dies.
             event = PingEvent(peer_id=peer_id, rtts=rtts, failure_error=None)
-        except Exception as error:
-            try:
-                await stream.reset()
-            except Exception:
-                pass
-            event = PingEvent(peer_id=peer_id, rtts=None, failure_error=error)
-            self._outbound_streams.pop(peer_id, None)
+        except BaseException as error:
+            # An outer fail_after delivers Cancelled here, not TooSlowError.
+            # Drop ownership before any await, and shield transport cleanup.
+            if self._outbound_streams.get(peer_id) is stream:
+                self._outbound_streams.pop(peer_id, None)
+            with trio.move_on_after(5) as cleanup_scope:
+                cleanup_scope.shield = True
+                try:
+                    await stream.reset()
+                except Exception:
+                    logger.debug("Failed to reset ping stream", exc_info=True)
+            if isinstance(error, Exception):
+                event = PingEvent(peer_id=peer_id, rtts=None, failure_error=error)
             raise
         finally:
             if event is not None:
