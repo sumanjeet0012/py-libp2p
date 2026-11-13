@@ -1502,16 +1502,16 @@ class GossipSub(IPubsubRouter, Service):
         if self.pubsub is None:
             raise NoPubsubAttached
 
-        # Skip if no peers have subscribed to the topic
-        if topic not in self.pubsub.peer_topics:
-            return current_peers, False
-
         # For fanout topics, check if we should remove the topic
         if is_fanout:
             if self.time_since_last_publish.get(topic, 0) + self.time_to_live < int(
                 time.time()
             ):
                 return set(), True
+
+        # Skip if no peers have subscribed to the topic
+        if topic not in self.pubsub.peer_topics:
+            return current_peers, False
 
         # Check if peers are still in the topic and remove the ones that are not
         in_topic_peers: set[ID] = {
@@ -1561,6 +1561,7 @@ class GossipSub(IPubsubRouter, Service):
             )
             if should_remove:
                 del self.fanout[topic]
+                self.time_since_last_publish.pop(topic, None)
             else:
                 self.fanout[topic] = updated_peers
 
@@ -2692,9 +2693,11 @@ class GossipSub(IPubsubRouter, Service):
             total_deliveries = 0
             successful_deliveries = 0
 
-            for topic, delivery_times in self.recent_message_deliveries.items():
+            for topic, delivery_times in list(self.recent_message_deliveries.items()):
                 # Clean old entries
                 delivery_times[:] = [t for t in delivery_times if t > cutoff_time]
+                if not delivery_times:
+                    del self.recent_message_deliveries[topic]
 
                 # Count deliveries (simplified - in real implementation,
                 # track success/failure separately)
@@ -3572,6 +3575,23 @@ class GossipSub(IPubsubRouter, Service):
         Periodic cleanup of security-related data structures.
         """
         current_time = time.time()
+
+        # Health computation can be disabled or return early with no mesh.
+        # Ownership expiry must still run on every heartbeat.
+        cutoff = current_time - 60.0
+        self.recent_peer_connections[:] = [
+            t for t in self.recent_peer_connections if t > cutoff
+        ]
+        self.recent_peer_disconnections[:] = [
+            t for t in self.recent_peer_disconnections if t > cutoff
+        ]
+        for topic, timestamps in list(self.recent_message_deliveries.items()):
+            timestamps[:] = [t for t in timestamps if t > cutoff]
+            if not timestamps:
+                del self.recent_message_deliveries[topic]
+        for topic, published in list(self.time_since_last_publish.items()):
+            if published + self.time_to_live < current_time:
+                del self.time_since_last_publish[topic]
 
         # A departed peer may never be checked by _check_back_off again.
         # Preserve live bans across reconnects, then expire them on heartbeat.

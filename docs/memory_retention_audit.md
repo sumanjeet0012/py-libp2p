@@ -74,3 +74,26 @@ CIDs and cumulative request/timeout totals. A 1,000-cancellation stress case
 retains only an unrelated outstanding CID. These four regressions fail on
 `b2d7e9f2` and pass after cleanup. Their production RSS contribution has not
 been isolated; HAVE probes are not used by the normal py-ipfs-lite fetch path.
+
+## Final active-path pass
+
+GossipSub's health calculation returns early when no mesh topics exist, skipping
+expiry of connection/disconnection history. Delivery timestamps were also
+recorded even when adaptive health was disabled. Heartbeat maintenance now
+expires both histories regardless of health mode and removes expired empty
+per-topic delivery/publish entries. This matters for nodes running pubsub
+without joining topics, including the production configuration.
+
+Fanout expiry previously returned early when subscriber topic state vanished,
+and removed fanout entries without their publish timestamps. Expiry now runs
+before the subscriber check and releases both owners. DHT value deletion,
+expiry and eviction now release local-key and republish metadata together;
+a republish finishing after deletion cannot recreate its timestamp.
+
+Nine additional regressions cover these cases, including 1,000-key churn and
+retention of recent connection events. Reviewed Swarm dial/health/round-robin
+cleanup, Noise cache call sites (not populated by the normal handshake path),
+DHT provider bounds, pubsub rate-state expiry, existing transport teardown,
+and Bitswap request ownership. User-owned published content, live streams,
+connection buffers, bounded caches and optional/native transports remain
+workload-dependent; this is not an exhaustive leak-free certification.

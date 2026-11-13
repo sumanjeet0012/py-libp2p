@@ -165,7 +165,7 @@ class ValueStore:
                     oldest_key.hex(),
                     MAX_VALUE_STORE_SIZE,
                 )
-                del self.store[oldest_key]
+                self._discard_record(oldest_key)
 
     def put(self, key: bytes, value: bytes, validity: float = 0.0) -> None:
         """
@@ -242,7 +242,7 @@ class ValueStore:
         for key in local_keys_snapshot:
             # Skip if not in store (may have been evicted)
             if key not in self.store:
-                self.local_keys.discard(key)
+                self._discard_record(key)
                 continue
 
             # Check if republish is due
@@ -267,7 +267,8 @@ class ValueStore:
                     except Exception as e:
                         logger.debug(f"Failed to republish to {peer_id}: {e}")
 
-                self._last_republish[key] = current_time
+                if key in self.store and key in self.local_keys:
+                    self._last_republish[key] = current_time
                 republished += 1
             except Exception as e:
                 logger.debug(f"Failed to republish record for key {key.hex()}: {e}")
@@ -571,6 +572,12 @@ class ValueStore:
             if stream:
                 await stream.close()
 
+    def _discard_record(self, key: bytes) -> None:
+        """Release the value and all auxiliary ownership together."""
+        self.store.pop(key, None)
+        self.local_keys.discard(key)
+        self._last_republish.pop(key, None)
+
     def remove(self, key: bytes) -> bool:
         """
         Remove a value from the DHT.
@@ -587,7 +594,7 @@ class ValueStore:
 
         """
         if key in self.store:
-            del self.store[key]
+            self._discard_record(key)
             logger.debug(f"Removed value for key {key.hex()[:8]}...")
             self._save()
             return True
@@ -634,7 +641,7 @@ class ValueStore:
         ]
 
         for key in expired_keys:
-            del self.store[key]
+            self._discard_record(key)
 
         if expired_keys:
             logger.debug(f"Cleaned up {len(expired_keys)} expired values")

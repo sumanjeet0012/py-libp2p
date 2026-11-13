@@ -266,3 +266,90 @@ async def test_cancel_want_releases_pending_peer_statistics():
     assert set(stats._pending_requests) == {other}
     assert stats.requests_sent == 1001
     assert stats.timeouts == 0
+
+
+@pytest.mark.parametrize("subscribers", [False, True])
+def test_expired_fanout_releases_topic_and_publish_time(subscribers):
+    import time
+
+    pubsub, router = make_pubsub()
+    for i in range(1000):
+        topic = str(i)
+        router.fanout[topic] = set()
+        router.time_since_last_publish[topic] = int(time.time()) - 10000
+        if subscribers:
+            pubsub.peer_topics[topic] = set()
+    router.fanout_heartbeat()
+    assert not router.fanout
+    assert not router.time_since_last_publish
+
+
+def test_delivery_health_releases_expired_topic_keys():
+    _, router = make_pubsub()
+    for i in range(1000):
+        router.recent_message_deliveries[str(i)] = [0.0]
+    router._calculate_message_delivery_health()
+    assert not router.recent_message_deliveries
+
+
+@pytest.mark.parametrize("mode", ["remove", "expire", "evict"])
+def test_value_removal_releases_republish_metadata(monkeypatch, mode):
+    from libp2p.kad_dht.pb.kademlia_pb2 import Record
+    from libp2p.kad_dht.value_store import ValueStore
+
+    host: Any = SimpleNamespace()
+    store = ValueStore(host, ID(b"local"))
+    monkeypatch.setattr("libp2p.kad_dht.value_store.MAX_VALUE_STORE_SIZE", 1)
+    for i in range(1000):
+        key = str(i).encode()
+        store.store[key] = (Record(key=key), 0.0)
+        store.local_keys.add(key)
+        store._last_republish[key] = 1.0
+        if mode == "remove":
+            store.remove(key)
+        elif mode == "expire":
+            store.cleanup_expired()
+        else:
+            store._evict_if_full()
+    assert not store.store
+    assert not store.local_keys
+    assert not store._last_republish
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_heartbeat_expires_histories_without_mesh_topics(adaptive):
+    import time
+
+    _, router = make_pubsub()
+    router.adaptive_gossip_enabled = adaptive
+    now = time.time()
+    router.recent_peer_connections[:] = [0.0] * 1000 + [now]
+    router.recent_peer_disconnections[:] = [0.0] * 1000 + [now]
+    router.recent_message_deliveries["gone"] = [0.0] * 1000
+    router.time_since_last_publish["gone"] = 0
+    router._periodic_security_cleanup()
+    assert router.recent_peer_connections == [now]
+    assert router.recent_peer_disconnections == [now]
+    assert not router.recent_message_deliveries
+    assert not router.time_since_last_publish
+
+
+@pytest.mark.trio
+async def test_republish_finishing_after_removal_does_not_retain_timestamp():
+    from libp2p.kad_dht.pb.kademlia_pb2 import Record
+    from libp2p.kad_dht.value_store import ValueStore
+
+    host: Any = SimpleNamespace(
+        get_event_bus=lambda: SimpleNamespace(emit=lambda event: None)
+    )
+    store = ValueStore(host, ID(b"local"))
+    store.store[b"key"] = (Record(key=b"key"), 0.0)
+    store.local_keys.add(b"key")
+
+    async def lookup(key):
+        store.remove(key)
+        await trio.lowlevel.checkpoint()
+        return []
+
+    await store._republish_records(SimpleNamespace(find_closest_peers_network=lookup))
+    assert not store._last_republish
