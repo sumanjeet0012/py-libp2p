@@ -298,24 +298,33 @@ class MplexStream(IMuxedStream):
             if self.event_reset.is_set():
                 return
             self.event_reset.set()
+            notify_remote = not self.event_remote_closed.is_set()
 
-            if not self.event_remote_closed.is_set():
+        try:
+            if notify_remote:
                 flag = self._get_header_flag("reset")
-                # Try to send reset message to the other side.
-                # Ignore if there is anything wrong.
                 try:
-                    await self.muxed_conn.send_message(flag, None, self.stream_id)
+                    with trio.move_on_after(5):
+                        await self.muxed_conn.send_message(flag, None, self.stream_id)
                 except MuxedConnUnavailable:
                     pass
-
-            self.event_local_closed.set()
-            self.event_remote_closed.set()
-
-            await self.incoming_data_channel.aclose()
-
-        async with self.muxed_conn.streams_lock:
-            if self.muxed_conn.streams is not None:
-                self.muxed_conn.streams.pop(self.stream_id, None)
+        finally:
+            # A cancelled reset send must still release local ownership. Do not
+            # hold close_lock while acquiring streams_lock: connection cleanup
+            # acquires those locks in the opposite order.
+            with trio.CancelScope() as cleanup_scope:
+                cleanup_scope.shield = True
+                async with self.close_lock:
+                    self.event_local_closed.set()
+                    self.event_remote_closed.set()
+                    await self.incoming_data_channel.aclose()
+                async with self.muxed_conn.streams_lock:
+                    self.muxed_conn.streams.pop(self.stream_id, None)
+                    channel = self.muxed_conn.streams_msg_channels.pop(
+                        self.stream_id, None
+                    )
+                if channel is not None:
+                    await channel.aclose()
 
     def _validate_ttl(self, ttl: int) -> bool:
         """

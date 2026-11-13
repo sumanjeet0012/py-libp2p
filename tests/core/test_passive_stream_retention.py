@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import trio
 
 from libp2p.abc import ISecureConn
 from libp2p.network.connection.swarm_connection import SwarmConn
@@ -39,6 +40,27 @@ async def test_mplex_graceful_churn_releases_channel_registry(remote_first):
             await stream.close()
             await conn._handle_close(sid)
         assert await stream.read(8) == b"buffered"
+        assert not conn.streams
+        assert not conn.streams_msg_channels
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("cancel_send", [False, True])
+async def test_mplex_local_reset_releases_both_registries(cancel_send):
+    async def write(data):
+        if cancel_send:
+            await trio.sleep_forever()
+
+    conn = Mplex(
+        cast(ISecureConn, SimpleNamespace(is_initiator=True, write=write)),
+        ID(b"peer"),
+    )
+    for index in range(100):
+        sid = StreamID(channel_id=index, is_initiator=True)
+        stream = await conn._initialize_stream(sid, "test")
+        with trio.move_on_after(0.001) as scope:
+            await stream.reset()
+        assert scope.cancelled_caught == cancel_send
         assert not conn.streams
         assert not conn.streams_msg_channels
 
