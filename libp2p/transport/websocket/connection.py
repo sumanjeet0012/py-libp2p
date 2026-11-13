@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
@@ -142,6 +143,7 @@ class P2PWebSocketConnection(ReadWriteCloser):
 
         # State management
         self._closed = False
+        self._on_close: Callable[[], Awaitable[None]] | None = None
         self._read_lock = trio.Lock()
         self._write_lock = trio.Lock()
         self._close_lock = trio.Lock()
@@ -482,6 +484,13 @@ class P2PWebSocketConnection(ReadWriteCloser):
                 self._closed = True
                 raise IOException(f"Write failed: {str(e)}") from e
 
+    async def _notify_closed(self) -> None:
+        callback, self._on_close = self._on_close, None
+        if callback is not None:
+            with trio.move_on_after(5) as scope:
+                scope.shield = True
+                await callback()
+
     async def close(self) -> None:
         """
         Close the WebSocket connection. This method is idempotent.
@@ -490,6 +499,8 @@ class P2PWebSocketConnection(ReadWriteCloser):
         """
         async with self._close_lock:
             if self._closed:
+                # A remote EOF may have set this flag before close() runs.
+                await self._notify_closed()
                 return  # Already closed
 
             logger.debug("WebSocket connection closing")
@@ -499,6 +510,7 @@ class P2PWebSocketConnection(ReadWriteCloser):
             except Exception as e:
                 logger.error(f"WebSocket close error: {e}")
             finally:
+                await self._notify_closed()
                 logger.debug("WebSocket connection closed")
 
     def is_closed(self) -> bool:

@@ -632,6 +632,8 @@ class WebsocketTransport(ITransport):
     async def _track_connection(self, conn: P2PWebSocketConnection) -> None:
         """Track a new connection."""
         async with self._connection_lock:
+            if conn.is_closed():
+                raise OpenConnectionError("WebSocket closed before registration")
             if self._current_connections >= self._config.max_connections:
                 raise OpenConnectionError("Maximum connections reached")
 
@@ -639,6 +641,11 @@ class WebsocketTransport(ITransport):
             self._connections[conn_id] = conn
             self._current_connections += 1
             self._total_connections += 1
+
+            async def untrack() -> None:
+                await self._untrack_connection(conn)
+
+            conn._on_close = untrack
 
     async def _untrack_connection(self, conn: P2PWebSocketConnection) -> None:
         """Stop tracking a connection."""
@@ -726,7 +733,13 @@ class WebsocketTransport(ITransport):
                 raise OpenConnectionError(f"Failed to create connection to {ws_url}")
 
             # Track connection
-            await self._track_connection(conn)
+            try:
+                await self._track_connection(conn)
+            except BaseException:
+                with trio.move_on_after(5) as cleanup_scope:
+                    cleanup_scope.shield = True
+                    await conn.close()
+                raise
 
             logger.info(f"Connection established to {ws_url}")
             return conn
@@ -789,8 +802,10 @@ class WebsocketTransport(ITransport):
         # a wrapper task; any reader/connect error is caught by the wrapper
         # and delivered to the dialer as a result over a memory channel.
         result_send, result_recv = trio.open_memory_channel[object](1)
+        host_scope = trio.CancelScope()
 
-        async def _ws_client_host() -> None:
+        async def _ws_client_host_body() -> None:
+            conn: P2PWebSocketConnection | None = None
             try:
                 async with trio.open_nursery() as conn_nursery:
                     try:
@@ -879,14 +894,32 @@ class WebsocketTransport(ITransport):
                     pass
                 except BaseException:
                     pass
+            finally:
+                if conn is not None:
+                    with trio.move_on_after(5) as cleanup_scope:
+                        cleanup_scope.shield = True
+                        await conn.close()
+                result_send.close()
+
+        async def _ws_client_host() -> None:
+            with host_scope:
+                await _ws_client_host_body()
 
         self._background_nursery.start_soon(_ws_client_host)
 
         # Apply timeout to the connection process. The wrapper task enforces
         # the same timeout on its side; the receive below unblocks as soon as
         # either the connection or the error is delivered.
-        with trio.fail_after(self._config.handshake_timeout):
-            result = await result_recv.receive()
+        try:
+            with trio.fail_after(self._config.handshake_timeout):
+                result = await result_recv.receive()
+        except BaseException:
+            # The caller can cancel earlier than our handshake deadline.
+            # Its private reader/nursery must not outlive that abandoned dial.
+            host_scope.cancel()
+            raise
+        finally:
+            result_recv.close()
         if isinstance(result, OpenConnectionError):
             raise result
         if isinstance(result, BaseException):
