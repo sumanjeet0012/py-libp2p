@@ -153,3 +153,73 @@ async def test_cancelled_close_stops_private_reader_and_socket(
         await trio.sleep(1.1)
         assert socket.closed
         nursery.cancel_scope.cancel()
+
+
+@pytest.mark.trio
+async def test_unresponsive_close_releases_tracking_without_caller_timeout(
+    autojump_clock,
+):
+    upgrader: Any = SimpleNamespace()
+    transport = WebsocketTransport(upgrader, WebsocketConfig(max_connections=1))
+
+    async def close():
+        await trio.sleep_forever()
+
+    conn = P2PWebSocketConnection(SimpleNamespace(aclose=close))
+    await transport._track_connection(conn)
+    with trio.move_on_after(10) as guard:
+        await conn.close()
+    assert not guard.cancelled_caught, "close has no internal deadline"
+    assert not transport._connections
+    assert transport._current_connections == 0
+
+
+@pytest.mark.trio
+async def test_local_close_keeps_reader_until_handshake_finishes(
+    monkeypatch, autojump_clock
+):
+    upgrader: Any = SimpleNamespace()
+    transport = WebsocketTransport(upgrader)
+    requested = trio.Event()
+    acknowledged = trio.Event()
+
+    class Socket:
+        async def aclose(self):
+            pass
+
+    class WebSocket:
+        closed: CloseReason | None = None
+
+        async def aclose(self):
+            self.closed = CloseReason(1000, "local close")
+            requested.set()
+            await acknowledged.wait()
+
+    ws = WebSocket()
+
+    async def reader():
+        await requested.wait()
+        await trio.sleep(2)
+        acknowledged.set()
+        await trio.sleep_forever()
+
+    async def open_socket(*args, **kwargs):
+        return Socket()
+
+    async def handshake(nursery, *args, **kwargs):
+        nursery.start_soon(reader)
+        return ws
+
+    monkeypatch.setattr(trio, "open_tcp_stream", open_socket)
+    monkeypatch.setattr("trio_websocket.wrap_client_stream", handshake)
+    proto = parse_websocket_multiaddr(Multiaddr("/ip4/127.0.0.1/tcp/4001/ws"))
+    async with trio.open_nursery() as nursery:
+        transport.set_background_nursery(nursery)
+        conn = await transport._create_direct_connection(proto, None)
+        await transport._track_connection(conn)
+        with trio.move_on_after(10) as guard:
+            await conn.close()
+        assert not guard.cancelled_caught
+        assert acknowledged.is_set(), "reader cancelled before close acknowledgement"
+        assert not transport._connections
+        nursery.cancel_scope.cancel()

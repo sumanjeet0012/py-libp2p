@@ -112,6 +112,7 @@ class P2PWebSocketConnection(ReadWriteCloser):
         max_buffer: int = 4 * 1024 * 1024,
         is_secure: bool = False,
         max_buffered_amount: int = 8 * 1024 * 1024,
+        close_timeout: float = 5.0,
     ) -> None:
         """
         Initialize a new WebSocket connection.
@@ -127,8 +128,12 @@ class P2PWebSocketConnection(ReadWriteCloser):
             max_buffer: Maximum buffer size in bytes
             is_secure: Whether this is a secure connection
             max_buffered_amount: Maximum buffered amount for flow control
+            close_timeout: Maximum time to wait for a close handshake
 
         """
+        if close_timeout <= 0:
+            raise ValueError("close_timeout must be positive")
+        self._close_timeout = close_timeout
         self._ws = ws_connection
         self._ws_connection = ws_connection
         self._local_addr = local_addr
@@ -508,7 +513,10 @@ class P2PWebSocketConnection(ReadWriteCloser):
             logger.debug("WebSocket connection closing")
             self._closed = True
             try:
-                await self._ws_connection.aclose()
+                # A peer may never acknowledge our close frame. Bound the
+                # handshake so tracking and the private reader are released.
+                with trio.move_on_after(self._close_timeout):
+                    await self._ws_connection.aclose()
             except Exception as e:
                 logger.error(f"WebSocket close error: {e}")
             finally:

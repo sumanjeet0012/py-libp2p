@@ -38,3 +38,19 @@ and integration tests, then validate the immutable production image and deploy.
 Use 10-second ownership/native-memory samples and rolling five-minute reports
 for early feedback. Longer soaks run in the background and do not gate a fix.
 A clean short run cannot exclude every slow leak.
+
+## Follow-up: WebSocket close acknowledgement
+
+Live ten-second samples exposed one closed WebSocket retained for more than
+nine minutes. A focused regression reproduced a local-close deadlock: the
+private host interpreted `WebSocketConnection.closed` as completed teardown,
+but trio-websocket sets that property when sending the close frame. Cancelling
+the reader then prevented the pending close acknowledgement from arriving.
+The wrapper also had no internal close deadline, so its registry callback could
+remain unreachable indefinitely.
+
+Keep the reader alive until the wrapper finishes closing, and apply the
+configured five-second close deadline to outbound and inbound wrappers. Tests
+cover a delayed acknowledgement and an unresponsive peer using Trio's virtual
+clock. Both failed before the change; both pass after it. This explains a
+confirmed retained-owner path, not the entire live RSS slope.

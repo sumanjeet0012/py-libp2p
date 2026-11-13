@@ -872,6 +872,7 @@ class WebsocketTransport(ITransport):
                         None,  # local_addr will be set after upgrade
                         is_secure=proto_info.is_wss,
                         max_buffered_amount=self._config.max_buffered_amount,
+                        close_timeout=self._config.close_timeout,
                     )
                     try:
                         await result_send.send(conn)
@@ -880,7 +881,12 @@ class WebsocketTransport(ITransport):
 
                     # Keep the private nursery (and the reader task) alive for
                     # as long as the connection is open.
-                    while ws.closed is None and not conn._close_finished:
+                    while not conn._close_finished:
+                        if ws.closed is not None:
+                            # closed is set when a local close STARTS. Its
+                            # reader must survive to receive the acknowledgement.
+                            await conn.close()
+                            break
                         await trio.sleep(1)
                     conn_nursery.cancel_scope.cancel()
             except trio.Cancelled:
@@ -989,6 +995,7 @@ class WebsocketTransport(ITransport):
                     None,  # local_addr will be set after upgrade
                     is_secure=proto_info.is_wss,
                     max_buffered_amount=self._config.max_buffered_amount,
+                    close_timeout=self._config.close_timeout,
                 )
 
                 logger.debug("Proxy connection established, tracking connection")
