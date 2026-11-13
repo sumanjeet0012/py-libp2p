@@ -54,3 +54,23 @@ configured five-second close deadline to outbound and inbound wrappers. Tests
 cover a delayed acknowledgement and an unresponsive peer using Trio's virtual
 clock. Both failed before the change; both pass after it. This explains a
 confirmed retained-owner path, not the entire live RSS slope.
+
+## Follow-up: scoring and cancelled Bitswap requests
+
+Repeated IP updates removed a peer from its old exact-IP set but left it in
+all previous subnet sets. Disconnect removed only the current subnet. A
+1,000-address churn regression now retains only another live peer's membership;
+replacing an IP uses the complete existing IP/subnet removal path.
+
+Bitswap `have_block()` registered its want and sent the initial probe before
+entering `try/finally`. Failure or cancellation during that setup leaked the
+want. Cleanup now covers setup as well as response waiting. Both outcomes are
+reproduced using an immediate error or cancellation checkpoint.
+
+Cancelling a global Bitswap want also left per-peer pending latency timestamps
+behind (notably after interrupted batch requests, before their timeout path).
+Cancel now forgets that CID's pending samples across peers, preserving other
+CIDs and cumulative request/timeout totals. A 1,000-cancellation stress case
+retains only an unrelated outstanding CID. These four regressions fail on
+`b2d7e9f2` and pass after cleanup. Their production RSS contribution has not
+been isolated; HAVE probes are not used by the normal py-ipfs-lite fetch path.

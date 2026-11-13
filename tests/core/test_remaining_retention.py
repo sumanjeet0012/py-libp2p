@@ -194,3 +194,75 @@ def test_releasing_one_scope_preserves_another_active_owner():
     assert rm._protocol_peer_stream_counts == {("protocol", "two"): 1}
     rm.release_scoped_stream("two", Direction.OUTBOUND, "service", "protocol")
     assert rm._current_streams == 0
+
+
+def test_scorer_ip_changes_release_old_subnet_membership():
+    from libp2p.pubsub.score import PeerScorer, ScoreParams
+
+    scorer = PeerScorer(ScoreParams())
+    peer = ID(b"moving")
+    survivor = ID(b"staying")
+    scorer.add_peer_ip(survivor, "10.0.0.2")
+    for i in range(1000):
+        scorer.add_peer_ip(peer, f"10.{i // 256}.{i % 256}.1")
+    scorer.remove_peer(peer)
+    assert scorer.peer_ips == {"10.0.0.2": {survivor}}
+    assert scorer.subnet_tracking == {"10.0.0": {survivor}}
+    scorer.remove_peer(survivor)
+    assert not scorer.subnet_tracking
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("outcome", ["error", "cancel"])
+async def test_have_probe_setup_failure_releases_want(monkeypatch, outcome):
+    from libp2p.bitswap.cid import compute_cid_v1
+    from libp2p.bitswap.client import BitswapClient
+
+    host: Any = SimpleNamespace(
+        get_event_bus=lambda: SimpleNamespace(emit=lambda event: None),
+        get_network=lambda: SimpleNamespace(connections={}),
+        set_stream_handler=lambda *args: None,
+    )
+    client = BitswapClient(host)
+    cid = compute_cid_v1(b"probe")
+
+    async def send(*args):
+        if outcome == "error":
+            raise RuntimeError("setup failed")
+        await trio.lowlevel.checkpoint()
+
+    monkeypatch.setattr(client, "_send_wantlist_to_peer", send)
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="setup failed"):
+            await client.have_block(cid, ID(b"remote"))
+    else:
+        with trio.CancelScope() as scope:
+            scope.cancel()
+            await client.have_block(cid, ID(b"remote"))
+    assert not client._wantlist
+    assert not client._broadcast_wants
+
+
+@pytest.mark.trio
+async def test_cancel_want_releases_pending_peer_statistics():
+    from libp2p.bitswap.cid import compute_cid_v1, parse_cid
+    from libp2p.bitswap.client import BitswapClient
+
+    host: Any = SimpleNamespace(
+        get_event_bus=lambda: SimpleNamespace(emit=lambda event: None),
+        get_network=lambda: SimpleNamespace(connections={}),
+        set_stream_handler=lambda *args: None,
+    )
+    client = BitswapClient(host)
+    peer = ID(b"remote")
+    other = parse_cid(compute_cid_v1(b"still active"))
+    client.peer_manager.record_request(peer, other)
+    for i in range(1000):
+        cid = parse_cid(compute_cid_v1(str(i).encode()))
+        await client.want_block(cid)
+        client.peer_manager.record_request(peer, cid)
+        await client.cancel_want(cid)
+    stats = client.peer_manager.peers[peer]
+    assert set(stats._pending_requests) == {other}
+    assert stats.requests_sent == 1001
+    assert stats.timeouts == 0

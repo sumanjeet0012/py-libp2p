@@ -225,12 +225,8 @@ class PeerScorer:
         :param peer: The peer ID
         :param ip_str: The IP address as a string
         """
-        # Remove peer from old IP if it exists
-        if peer in self.ip_by_peer:
-            old_ip = self.ip_by_peer[peer]
-            self.peer_ips[old_ip].discard(peer)
-            if not self.peer_ips[old_ip]:
-                del self.peer_ips[old_ip]
+        # Release both IP and subnet ownership before replacing the address.
+        self.remove_peer_ip(peer)
 
         # Add peer to new IP
         self.peer_ips[ip_str].add(peer)

@@ -487,18 +487,17 @@ class BitswapClient(INotifee):
         if await self.block_store.has_block(cid_obj):
             return True
 
-        # Add to wantlist with Have type
-        await self.want_block(cid_obj, want_type=1, send_dont_have=True)
-
-        # Send wantlist to peer(s)
-        if peer_id:
-            await self._send_wantlist_to_peer(peer_id, [cid_obj])
-        else:
-            await self._broadcast_wantlist([cid_obj])
-
-        # Wait for Have/DontHave response via presence manager
         result = False
         try:
+            # Add to wantlist with Have type
+            await self.want_block(cid_obj, want_type=1, send_dont_have=True)
+
+            # Send wantlist to peer(s)
+            if peer_id:
+                await self._send_wantlist_to_peer(peer_id, [cid_obj])
+            else:
+                await self._broadcast_wantlist([cid_obj])
+
             with trio.fail_after(5.0):
                 while True:
                     # Check if presence manager recorded a Have from any peer
@@ -532,6 +531,7 @@ class BitswapClient(INotifee):
 
         """
         cid_obj = parse_cid(cid)
+        self.peer_manager.cancel_pending_request(cid_obj)
 
         if cid_obj in self._wantlist:
             del self._wantlist[cid_obj]
