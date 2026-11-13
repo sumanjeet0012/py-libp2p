@@ -3,6 +3,7 @@ QUIC Stream implementation
 Provides stream interface over QUIC's native multiplexing.
 """
 
+from collections.abc import Awaitable, Callable
 from enum import Enum
 import logging
 import time
@@ -160,6 +161,7 @@ class QUICStream(IMuxedStream):
         self._write_closed = False
         self._read_closed = False
         self._close_event = trio.Event()
+        self._close_callback: Callable[[], Awaitable[None]] | None = None
         self._reset_error_code: int | None = None
 
         # Lifecycle tracking
@@ -479,6 +481,7 @@ class QUICStream(IMuxedStream):
                     self._state = StreamState.WRITE_CLOSED
 
             logger.debug(f"Stream {self.stream_id} write side closed")
+            await self._finish_graceful_close()
 
         except Exception as e:
             # Classify the exception using isinstance instead of string matching.
@@ -503,6 +506,7 @@ class QUICStream(IMuxedStream):
                 logger.debug(
                     f"Ignoring close_write error on stream {self.stream_id}: {e}"
                 )
+                await self._finish_graceful_close()
                 return
             logger.error(f"Error closing write side of stream {self.stream_id}: {e}")
 
@@ -532,6 +536,7 @@ class QUICStream(IMuxedStream):
             self._receive_event.set()
 
             logger.debug(f"Stream {self.stream_id} read side closed")
+            await self._finish_graceful_close()
 
         except Exception as e:
             logger.error(f"Error closing read side of stream {self.stream_id}: {e}")
@@ -683,6 +688,7 @@ class QUICStream(IMuxedStream):
             self._receive_event.set()
 
             logger.debug(f"Stream {self.stream_id} received FIN")
+            await self._finish_graceful_close()
 
     async def handle_stop_sending(self, error_code: int) -> None:
         """
@@ -884,7 +890,33 @@ class QUICStream(IMuxedStream):
                     f"Failed to release memory for stream {self.stream_id}: {e}"
                 )
 
-    async def _cleanup_resources(self) -> None:
+    async def set_close_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """
+        Bridge transport termination to its outer network-stream owner.
+
+        Registration may race with a remote reset while opened-stream listeners
+        run. Deliver that termination immediately if it already happened.
+        """
+        self._close_callback = callback
+        if self.is_closed():
+            await self._notify_closed()
+
+    async def _notify_closed(self) -> None:
+        callback, self._close_callback = self._close_callback, None
+        if callback is not None:
+            with trio.move_on_after(5) as scope:
+                scope.shield = True
+                await callback()
+
+    async def _finish_graceful_close(self) -> None:
+        if self.is_closed():
+            self._timeline.record_close()
+            # FIN completes transport ownership, but queued reply bytes must
+            # remain readable after the local write side has been half-closed.
+            await self._cleanup_resources(discard_buffer=False)
+            self._close_event.set()
+
+    async def _cleanup_resources(self, discard_buffer: bool = True) -> None:
         """Clean up stream resources."""
         # Release all reserved memory
         if self._memory_reserved > 0:
@@ -895,7 +927,8 @@ class QUICStream(IMuxedStream):
         # alive until GC collected the QUICStream, but reference cycles
         # between QUICStream → QUICConnection → aioquic prevent timely
         # collection, causing indefinite RSS growth.
-        self._receive_buffer.clear()
+        if discard_buffer:
+            self._receive_buffer.clear()
 
         # Release resource scope if present
         if self._resource_scope:
@@ -912,6 +945,7 @@ class QUICStream(IMuxedStream):
 
         # Remove from connection's stream registry
         self._connection._remove_stream(self._stream_id)
+        await self._notify_closed()
 
         logger.debug(f"Stream {self.stream_id} resources cleaned up")
 

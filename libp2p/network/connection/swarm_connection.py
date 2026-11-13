@@ -342,9 +342,7 @@ class SwarmConn(INetConn):
                     pass
             return
 
-        net_stream = await self._add_stream(muxed_stream)
-        # Tag stream with direction so notify_closed_stream releases resources
-        net_stream._direction = Direction.INBOUND
+        net_stream = await self._add_stream(muxed_stream, Direction.INBOUND)
         try:
             await self.swarm.common_stream_handler(net_stream)
         finally:
@@ -354,8 +352,11 @@ class SwarmConn(INetConn):
             if not net_stream._resource_released:
                 await self.swarm.notify_closed_stream(net_stream)
 
-    async def _add_stream(self, muxed_stream: IMuxedStream) -> NetStream:
+    async def _add_stream(
+        self, muxed_stream: IMuxedStream, direction: Direction = Direction.UNKNOWN
+    ) -> NetStream:
         net_stream = NetStream(muxed_stream, self, self._metric_send_channel)
+        net_stream._direction = direction
         # Set Stream state to OPEN if the event has already started.
         # This is to ensure that the new streams created after connection has started
         # are immediately set to OPEN state.
@@ -363,6 +364,12 @@ class SwarmConn(INetConn):
             await net_stream.set_state(StreamState.OPEN)
         self.streams.add(net_stream)
         await self.swarm.notify_opened_stream(net_stream)
+        # QUIC can terminate asynchronously, without an application read/reset.
+        # Register after the opened notification so listeners observe lifecycle
+        # events in order. The setter also handles termination during that await.
+        set_close_callback = getattr(type(muxed_stream), "set_close_callback", None)
+        if set_close_callback is not None:
+            await set_close_callback(muxed_stream, net_stream.remove)
         return net_stream
 
     async def _notify_disconnected(self) -> None:
@@ -379,7 +386,7 @@ class SwarmConn(INetConn):
 
     async def new_stream(self) -> NetStream:
         muxed_stream = await self.muxed_conn.open_stream()
-        return await self._add_stream(muxed_stream)
+        return await self._add_stream(muxed_stream, Direction.OUTBOUND)
 
     def get_streams(self) -> tuple[NetStream, ...]:
         return tuple(self.streams)
