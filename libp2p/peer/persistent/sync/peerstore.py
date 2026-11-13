@@ -227,6 +227,19 @@ class SyncPersistentPeerStore(IPeerStore):
                     # Convert nanoseconds back to seconds for latmap
                     peer_data.latmap = latency_ns / 1_000_000_000
 
+                # LRU eviction must not turn a finite address TTL into the
+                # PeerData default (zero means permanent). Older databases
+                # lack this optional record and retain their legacy behavior.
+                additional_data = self.datastore.get(self._get_additional_key(peer_id))
+                if additional_data:
+                    additional = deserialize_metadata(additional_data)
+                    peer_data.ttl = int(additional.get("ttl", b"0"))
+                    peer_data.last_identified = int(
+                        additional.get(
+                            "last_identified", str(peer_data.last_identified)
+                        )
+                    )
+
             except (
                 SerializationError,
                 CryptographyError,
@@ -247,6 +260,15 @@ class SyncPersistentPeerStore(IPeerStore):
             self._enforce_peer_data_cache_limit()
             return peer_data
 
+    def _persist_field(self, key: bytes, value: bytes | None) -> None:
+        """Persist deletion too, without rewriting unchanged peer fields."""
+        previous = self.datastore.get(key)
+        if value is None:
+            if previous is not None:
+                self.datastore.delete(key)
+        elif previous != value:
+            self.datastore.put(key, value)
+
     def _save_peer_data(self, peer_id: ID, peer_data: PeerData) -> None:
         """
         Save peer data to datastore.
@@ -258,10 +280,17 @@ class SyncPersistentPeerStore(IPeerStore):
         """
         try:
             # Save addresses
-            if peer_data.addrs:
-                addr_key = self._get_addr_key(peer_id)
-                addr_data = serialize_addresses(peer_data.addrs)
-                self.datastore.put(addr_key, addr_data)
+            self._persist_field(
+                self._get_addr_key(peer_id),
+                serialize_addresses(peer_data.addrs) if peer_data.addrs else None,
+            )
+
+            self._persist_field(
+                self._get_additional_key(peer_id),
+                serialize_metadata(
+                    {"ttl": peer_data.ttl, "last_identified": peer_data.last_identified}
+                ),
+            )
 
             # Save keys as serialized metadata (pubkey/privkey protobuf bytes)
             if peer_data.pubkey or peer_data.privkey:
@@ -275,16 +304,18 @@ class SyncPersistentPeerStore(IPeerStore):
                 self.datastore.put(key_key, key_data)
 
             # Save metadata
-            if peer_data.metadata:
-                metadata_key = self._get_metadata_key(peer_id)
-                metadata_data = serialize_metadata(peer_data.metadata)
-                self.datastore.put(metadata_key, metadata_data)
+            self._persist_field(
+                self._get_metadata_key(peer_id),
+                serialize_metadata(peer_data.metadata) if peer_data.metadata else None,
+            )
 
             # Save protocols
-            if peer_data.protocols:
-                protocol_key = self._get_protocol_key(peer_id)
-                protocol_data = serialize_protocols(peer_data.protocols)
-                self.datastore.put(protocol_key, protocol_data)
+            self._persist_field(
+                self._get_protocol_key(peer_id),
+                serialize_protocols(peer_data.protocols)
+                if peer_data.protocols
+                else None,
+            )
 
             # Save latency data if available
             if hasattr(peer_data, "latmap") and peer_data.latmap > 0:
