@@ -848,9 +848,17 @@ class GossipSub(IPubsubRouter, Service):
         """
         if topic_id in self.mesh and peer_id in self.mesh[topic_id]:
             return
-        event = self._mesh_peer_events.setdefault((peer_id, topic_id), trio.Event())
-        with trio.fail_after(timeout):
-            await event.wait()
+        key = (peer_id, topic_id)
+        event = self._mesh_peer_events.setdefault(key, trio.Event())
+        try:
+            with trio.fail_after(timeout):
+                await event.wait()
+        finally:
+            if (
+                event.statistics().tasks_waiting == 0
+                and self._mesh_peer_events.get(key) is event
+            ):
+                self._mesh_peer_events.pop(key, None)
 
     async def on_peer_subscribed(self, peer_id: ID, topic: str) -> None:
         """

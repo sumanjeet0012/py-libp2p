@@ -1,6 +1,7 @@
 from collections.abc import (
     Sequence,
 )
+from itertools import chain
 import time
 
 from multiaddr import (
@@ -58,13 +59,13 @@ class PeerData(IPeerData):
         """
         :param protocols: protocols to add
         """
-        self.protocols.extend(list(protocols))
+        self.protocols[:] = dict.fromkeys(chain(self.protocols, protocols))
 
     def set_protocols(self, protocols: Sequence[str]) -> None:
         """
         :param protocols: protocols to set
         """
-        self.protocols = list(protocols)
+        self.protocols = list(dict.fromkeys(protocols))
 
     def remove_protocols(self, protocols: Sequence[str]) -> None:
         """

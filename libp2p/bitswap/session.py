@@ -66,6 +66,8 @@ class BitswapSession:
         if data is not None:
             return data
 
+        retry_scope: trio.CancelScope | None = None
+
         # 2. Try DHT discovery if peer_id is not given
         if peer_id is None and self.client.provider_query_manager is not None:
             # A real DHT walk on the public network routinely takes longer
@@ -101,8 +103,11 @@ class BitswapSession:
                 # failed forever after a single timed-out lookup.
                 deadline = time.time() + timeout
                 if self.client._nursery is not None:
+                    scope = trio.CancelScope()
+                    retry_scope = scope
+
                     self.client._nursery.start_soon(
-                        self._retry_provider_discovery, cid_obj, deadline
+                        self._scoped_provider_discovery, scope, cid_obj, deadline
                     )
                 else:
                     logger.debug(
@@ -112,7 +117,21 @@ class BitswapSession:
                         format_cid_for_display(cid_obj, max_len=12),
                     )
 
-        return await self._request_block(cid_obj, peer_id, timeout)
+        try:
+            result = await self._request_block(cid_obj, peer_id, timeout)
+        finally:
+            # This background lookup belongs to this fetch, not to the entire
+            # client service. Do not retain the session/socket or repopulate a
+            # completed request's provider cache after its want was cancelled.
+            if retry_scope is not None:
+                retry_scope.cancel()
+        return result
+
+    async def _scoped_provider_discovery(
+        self, scope: trio.CancelScope, cid: CIDObject, deadline: float
+    ) -> None:
+        with scope:
+            await self._retry_provider_discovery(cid, deadline)
 
     async def _dial_provider(self, peer_id: PeerID) -> bool:
         """Dial a provider peer if we have its addresses and are not connected."""

@@ -813,8 +813,15 @@ class Pubsub(Service, IPubsub):
         if peer_id in self.peers:
             return
         event = self._peer_added_events.setdefault(peer_id, trio.Event())
-        with trio.fail_after(timeout):
-            await event.wait()
+        try:
+            with trio.fail_after(timeout):
+                await event.wait()
+        finally:
+            if (
+                event.statistics().tasks_waiting == 0
+                and self._peer_added_events.get(peer_id) is event
+            ):
+                self._peer_added_events.pop(peer_id, None)
 
     async def wait_for_subscription(
         self, peer_id: ID, topic_id: str, timeout: float = 5.0
@@ -846,8 +853,15 @@ class Pubsub(Service, IPubsub):
             return
         key = (peer_id, topic_id)
         event = self._subscription_events.setdefault(key, trio.Event())
-        with trio.fail_after(timeout):
-            await event.wait()
+        try:
+            with trio.fail_after(timeout):
+                await event.wait()
+        finally:
+            if (
+                event.statistics().tasks_waiting == 0
+                and self._subscription_events.get(key) is event
+            ):
+                self._subscription_events.pop(key, None)
 
     async def wait_for_mesh(
         self, peer_id: ID, topic_id: str, timeout: float = 5.0

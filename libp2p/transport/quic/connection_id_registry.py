@@ -153,6 +153,12 @@ class ConnectionIDRegistry:
             times.pop(0)
         times.append(duration)
 
+    def _record_sequence(self, sequence: int) -> None:
+        # Exact low sequences plus an overflow bucket keep telemetry bounded.
+        # Routing still uses the full sequence in _connection_sequences.
+        bucket = sequence if 0 <= sequence < 128 else -1
+        self._sequence_distribution[bucket] += 1
+
     async def find_by_connection_id(  # pyrefly: ignore[bad-return]
         self, connection_id: bytes, is_initial: bool = False
     ) -> tuple["QUICConnection | None", "QuicConnection | None", bool]:
@@ -461,7 +467,7 @@ class ConnectionIDRegistry:
                 self._connection_sequences[connection][sequence] = connection_id
 
                 # Track sequence in distribution for performance metrics
-                self._sequence_distribution[sequence] += 1
+                self._record_sequence(sequence)
 
                 # Initialize sequence counter if not already set
                 if connection_id not in self._connection_sequence_counters:
@@ -657,7 +663,7 @@ class ConnectionIDRegistry:
                 # Track sequence number
                 self._connection_id_sequences[new_connection_id] = sequence
                 # Update sequence distribution
-                self._sequence_distribution[sequence] += 1
+                self._record_sequence(sequence)
 
                 # If connection is already promoted, also map new Connection ID
                 # to the connection
@@ -1518,6 +1524,7 @@ class ConnectionIDRegistry:
             "tracked_sequences": len(self._connection_id_sequences),
             "fallback_routing_count": self._fallback_routing_count,
             "sequence_distribution": dict(self._sequence_distribution),  # type: ignore
+            "sequence_distribution_overflow_bucket": -1,
             "lock_stats": self.get_lock_stats(),
         }
         if self._debug_timing and self._operation_timings:

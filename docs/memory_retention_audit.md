@@ -1,0 +1,40 @@
+# Memory retention audit
+
+This audit fixes reproduced ownership failures. It is not a certification that
+all library code, optional transports, native dependencies, and arbitrary user
+workloads are leak-free. RSS alone is not a leak test: intentional cache fill,
+live connection state, and allocator retention must be distinguished from
+objects that remain owned after their operation ends.
+
+## Additional confirmed defects
+
+| Owner                                                       | Failure                                                                                                   | Remediation and regression                                                                                                                              |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PubSub peer/subscription waiters and GossipSub mesh waiters | Timed-out or cancelled waits left events indexed indefinitely                                             | Remove an event when no tasks remain waiting; retain shared events for surviving callers. Exercise 1,000 timed-out waits and concurrent cancellation    |
+| PeerData protocol book                                      | Repeated additions retained duplicate strings and list slots                                              | Deduplicate add/set operations, preserving first-seen order and in-place add behavior; 1,000 repeated updates retain two protocols                      |
+| Fixed/sliding-window rate limiters                          | Entity histories lacked the token-bucket strategy's entity bound                                          | Apply the configured entity ceiling to every strategy; evict all state for the evicted least-recently-used entity; reject nonpositive tracking limits   |
+| Resource-manager scope counters                             | Released and rolled-back counters kept zero-valued peer/service/protocol keys                             | Delete zero counters under the existing lock; preserve nonzero owners and cover all four limit-rejection stages                                         |
+| QUIC per-connection diagnostic history                      | Retired CIDs and issued sequence histories grew for the connection's lifetime                             | Keep 128 recent history entries; cumulative issued/retired totals and live CID routing remain intact. Stress 5,000 rotations                            |
+| QUIC registry sequence histogram                            | Diagnostics kept every lifetime sequence even after unregister                                            | Keep exact buckets 0–127 and aggregate other sequences into overflow bucket -1; routing retains full sequences. Stress 2,000 register/unregister cycles |
+| Bitswap provider-discovery workers                          | A successful, failed, or cancelled fetch could leave its background lookup running until its old deadline | Give each fetch a private discovery cancel scope and cancel it when the fetch exits; test all three outcomes without waiting for wall-clock timeouts    |
+
+The validation-cache overwrite stress test passed without a code change.
+Provider/message caches, connection/peerstore bounds, and prior stream cleanup
+regressions remain part of the existing coverage. This pass also runs the
+related PubSub, QUIC CID, peerstore, resource-manager and Bitswap suites.
+
+## Diagnostic compatibility
+
+`get_connection_id_stats()['retired_connection_ids']` now counts recent retained
+identities, capped at 128. `connection_ids_retired` remains the lifetime event
+total. The sequence-distribution histogram has a documented overflow bucket
+of -1, also exposed as `sequence_distribution_overflow_bucket`; exact routing
+sequence numbers are unaffected.
+
+## Validation policy
+
+Reproduce teardown/timeout/cancellation failures in isolation first. Run targeted
+and integration tests, then validate the immutable production image and deploy.
+Use 10-second ownership/native-memory samples and rolling five-minute reports
+for early feedback. Longer soaks run in the background and do not gate a fix.
+A clean short run cannot exclude every slow leak.

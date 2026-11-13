@@ -207,6 +207,8 @@ class QUICConnection(IRawConnection, IMuxedConn):
         self._available_connection_ids: set[bytes] = set()
         self._current_connection_id: bytes | None = None
         self._retired_connection_ids: set[bytes] = set()
+        self._cid_history_limit = 128
+        self._retired_connection_id_order: deque[bytes] = deque()
         self._connection_id_sequence_numbers: set[int] = set()
         # Sequence number counter for tracking Connection IDs (inspired by quinn)
         # Starts at 0 for initial CID, increments for each new CID issued
@@ -350,6 +352,7 @@ class QUICConnection(IRawConnection, IMuxedConn):
             if self._current_connection_id
             else None,
             "retired_connection_ids": len(self._retired_connection_ids),
+            "recent_cid_history_limit": self._cid_history_limit,
             "connection_ids_issued": self._stats["connection_ids_issued"],
             "connection_ids_retired": self._stats["connection_ids_retired"],
             "connection_id_changes": self._stats["connection_id_changes"],
@@ -1387,6 +1390,10 @@ class QUICConnection(IRawConnection, IMuxedConn):
         sequence = self._connection_id_sequence_counter
         self._connection_id_sequence_counter += 1
         self._connection_id_sequence_numbers.add(sequence)
+        if len(self._connection_id_sequence_numbers) > self._cid_history_limit:
+            self._connection_id_sequence_numbers.remove(
+                min(self._connection_id_sequence_numbers)
+            )
 
         logger.debug(
             f"NEW CONNECTION ID ISSUED: {new_connection_id.hex()} (sequence {sequence})"
@@ -1487,7 +1494,14 @@ class QUICConnection(IRawConnection, IMuxedConn):
 
         # Remove from available IDs and add to retired set
         self._available_connection_ids.discard(event.connection_id)
-        self._retired_connection_ids.add(event.connection_id)
+        # This is diagnostic history, not routing or replay-protection state.
+        # Lifetime totals remain in _stats; retain only recent identities.
+        if event.connection_id not in self._retired_connection_ids:
+            if len(self._retired_connection_id_order) >= self._cid_history_limit:
+                oldest = self._retired_connection_id_order.popleft()
+                self._retired_connection_ids.discard(oldest)
+            self._retired_connection_id_order.append(event.connection_id)
+            self._retired_connection_ids.add(event.connection_id)
 
         # If this was our current connection ID, switch to another
         if self._current_connection_id == event.connection_id:
