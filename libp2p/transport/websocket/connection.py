@@ -143,6 +143,7 @@ class P2PWebSocketConnection(ReadWriteCloser):
 
         # State management
         self._closed = False
+        self._close_finished = False
         self._on_close: Callable[[], Awaitable[None]] | None = None
         self._read_lock = trio.Lock()
         self._write_lock = trio.Lock()
@@ -490,6 +491,7 @@ class P2PWebSocketConnection(ReadWriteCloser):
             with trio.move_on_after(5) as scope:
                 scope.shield = True
                 await callback()
+        self._close_finished = True
 
     async def close(self) -> None:
         """

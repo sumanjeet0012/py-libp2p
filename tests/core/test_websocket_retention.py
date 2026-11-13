@@ -113,3 +113,43 @@ async def test_cancelled_registration_closes_the_connected_socket(monkeypatch):
         await transport._create_connection(proto)
     assert scope.cancelled_caught
     assert closed == [True]
+
+
+@pytest.mark.trio
+async def test_cancelled_close_stops_private_reader_and_socket(
+    monkeypatch, autojump_clock
+):
+    upgrader: Any = SimpleNamespace()
+    transport = WebsocketTransport(upgrader)
+
+    class Socket:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class WebSocket:
+        closed = None
+
+        async def aclose(self):
+            await trio.sleep_forever()
+
+    socket = Socket()
+
+    async def open_socket(*args, **kwargs):
+        return socket
+
+    async def handshake(*args, **kwargs):
+        return WebSocket()
+
+    monkeypatch.setattr(trio, "open_tcp_stream", open_socket)
+    monkeypatch.setattr("trio_websocket.wrap_client_stream", handshake)
+    proto = parse_websocket_multiaddr(Multiaddr("/ip4/127.0.0.1/tcp/4001/ws"))
+    async with trio.open_nursery() as nursery:
+        transport.set_background_nursery(nursery)
+        conn = await transport._create_direct_connection(proto, None)
+        with trio.move_on_after(0.001):
+            await conn.close()
+        await trio.sleep(1.1)
+        assert socket.closed
+        nursery.cancel_scope.cancel()

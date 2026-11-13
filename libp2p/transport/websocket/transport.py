@@ -806,6 +806,7 @@ class WebsocketTransport(ITransport):
 
         async def _ws_client_host_body() -> None:
             conn: P2PWebSocketConnection | None = None
+            stream: trio.SocketStream | trio.SSLStream | None = None
             try:
                 async with trio.open_nursery() as conn_nursery:
                     try:
@@ -819,7 +820,6 @@ class WebsocketTransport(ITransport):
                         # open on every failed dial, which leaked both file
                         # descriptors and RSS in production. (Upstream fix.)
                         with trio.fail_after(self._config.handshake_timeout):
-                            stream: trio.SocketStream | trio.SSLStream
                             stream = await trio.open_tcp_stream(host, port)
                             try:
                                 if ssl_context is not None:
@@ -880,8 +880,9 @@ class WebsocketTransport(ITransport):
 
                     # Keep the private nursery (and the reader task) alive for
                     # as long as the connection is open.
-                    while ws.closed is None:
+                    while ws.closed is None and not conn._close_finished:
                         await trio.sleep(1)
+                    conn_nursery.cancel_scope.cancel()
             except trio.Cancelled:
                 raise
             except BaseException as exc:
@@ -899,6 +900,10 @@ class WebsocketTransport(ITransport):
                     with trio.move_on_after(5) as cleanup_scope:
                         cleanup_scope.shield = True
                         await conn.close()
+                if stream is not None:
+                    with trio.move_on_after(5) as socket_cleanup_scope:
+                        socket_cleanup_scope.shield = True
+                        await trio.aclose_forcefully(stream)
                 result_send.close()
 
         async def _ws_client_host() -> None:
